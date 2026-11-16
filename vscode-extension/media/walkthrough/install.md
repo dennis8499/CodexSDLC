@@ -16,4 +16,4 @@
 
 已經有一份解壓好的發佈物（或 `.zip`）的話，改用命令面板的 **Codex SDLC：選擇發佈物安裝…**。
 
-裝好之後，`.codex/hooks.json` 要 Codex 那邊信任過才會真的擋 —— 在專案裡開一次 `codex`，出現「Hooks need review」時選 Trust all and continue。**這個面板不會替你確認那一項**（要確認：`sdlc.ps1 doctor -CheckHookTrust`）。
+裝好之後，`.codex/hooks.json` 要 Codex 那邊信任過才會真的擋。**安裝時會一併替你在 Codex 信任**（確認框裡有寫；只信任這套工作流自己的 hooks），VS Code 的 Codex chat 不會出現「Hooks need review」，所以由這裡處理。之後要重來：命令面板的 **Codex SDLC：在 Codex 信任 hooks**。已經開著的 Codex 對話要開一個新的才會載入。

@@ -444,6 +444,38 @@ Describe-Suite 'agent-lint / 檢查 6：產物路徑合約' {
         } finally { Remove-Item $Scratch -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    It-Should 'data-model.md 生產者與路由者都提到、但 implementer／reviewer 沒提到 → 紅燈' {
+        # v4.27.0：sa-analyst 把會動 schema 的做法的資料表設計寫成這個檔，③ 給使用者確認。
+        # implementer 不讀它，資料表又回到 ④ 自由發揮；reviewer 不讀它，建出來跟核准的不一樣也沒人看見 ——
+        # 兩種都不報錯，而且正是使用者回報的那件事（資料庫結構沒經過確認就被做出來）。
+        New-CleanScratch | Out-Null
+        New-ScratchOrchestrator @'
+## 委派
+
+| 要什麼 | 給誰 | mode |
+|---|---|---|
+| 查現況 | `sa-analyst` | `analyze` |
+| 實作 | `implementer` | `build`／`fix` |
+| 審核 | `reviewer` | `code` |
+
+③ 把 `bdd-docs/{feature-id}/data-model.md` 那一節的表格貼給使用者確認。
+'@ | Out-Null
+        New-ScratchAgent 'sa-analyst' '會動 schema 的做法寫進 `bdd-docs/{feature-id}/data-model.md`。' | Out-Null
+        New-ScratchAgent 'implementer' '照 spec.md 寫程式。' | Out-Null
+        New-ScratchAgent 'reviewer' '審實作。' | Out-Null
+        try {
+            $r = Invoke-Lint
+            Assert-Equal 2 $r.exit 'implementer／reviewer 沒提到 data-model.md 卻通過了'
+            Assert-Match 'artifact-path-orphan' $r.stderr
+            Assert-Match 'data-model\.md 未出現在 implementer' $r.stderr
+            Assert-Match 'data-model\.md 未出現在 reviewer' $r.stderr
+            New-ScratchAgent 'implementer' '資料表照 `bdd-docs/{feature-id}/data-model.md` 那一節建。' | Out-Null
+            New-ScratchAgent 'reviewer' 'migration 跟 `bdd-docs/{feature-id}/data-model.md` 逐欄比。' | Out-Null
+            $r = Invoke-Lint
+            Assert-Equal 0 $r.exit "四方都提到卻紅了；stderr: $($r.stderr)"
+        } finally { Remove-Item $Scratch -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     It-Should '沒有人用到的產物不強制' {
         # 這一版可能就是沒有 legacy-schema 的需求，不該因此紅燈。
         New-CleanScratch | Out-Null

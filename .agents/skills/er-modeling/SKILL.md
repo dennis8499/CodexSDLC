@@ -1,75 +1,72 @@
 ---
 name: er-modeling
-version: 1.0.0
-description: 從 domain rules、examples、schema 或 API DTO 產出 Mermaid ER 圖、資料字典與關聯/鍵/約束（P0-1 設計橋接）
+version: 2.0.0
+description: ② 做法會動 schema 時，sa-analyst 寫 bdd-docs/{feature-id}/data-model.md 的格式 —— 給使用者在 ③ 確認、implementer 在 ④ 照著建的資料表設計：新增與修改的表、欄位、型別、鍵、索引、關聯，以及既有資料怎麼辦
 ---
 
-# ER Modeling Skill
+# 資料表設計（`data-model.md`）
 
-> 用途：設計橋接階段（design）產出 **logical/specification-level ER model draft**，供 ATDD/TDD 對齊。
-> 產出不是 migration script，也不是正式 ER Model 審查治理產物。
+**這份是使用者在 ③ 確認、`implementer` 在 ④ 照著建、`reviewer` 在 ⑤ 拿來對照的資料表設計。** 寫成表格，是為了讓他用「看」就能否決：欄位名、型別、長度、能不能空 —— 這幾樣一旦上線有了資料，改起來就是一次 migration 加一次回填。
 
+## 什麼時候寫
 
-## 使用時機
+做法會新增或修改：資料表、欄位、索引、約束、view／SP／function，或代碼表、存進 DB 的列舉加新的值 → **每個這種做法一節**。都不動 schema 就不寫檔，做法的「資料模型」寫「無」。
 
-- Gherkin 定稿、domain glossary、candidate entities、rules、examples 已就緒，功能涉及資料持久化。
-- 使用者已提供脫敏後 DDL / schema 摘要 / ER 圖 / migration 片段需要詮釋時可提前使用。
-- 無資料持久化時**不要產出 ER 圖** —— 在回傳裡說一句「無持久化，不需資料模型」即可。
-
-## 輸入
-
-- glossary、candidate model、business rules、examples。
-- 脫敏後 DDL / migration 片段 / 資料表摘要 / 截圖 / ER 圖。
-- 若已有 API contract draft，其 schemas。
-- 資料來源策略與儲存假設。
-
-## 指引
-
-1. 從 domain 名詞與業務不變量出發，再設計資料表。
-2. 辨識 entity、value object、aggregate root、read model。
-3. 定義 identity、鍵屬性、required/nullable、約束。
-4. 辨識關聯型別（association / composition / aggregation）與 cardinality（1:1 / 1:N / N:M）。
-5. 每個多對多關係建立 junction entity/table。
-6. 記錄 PK、FK、unique、check、default、index 提示。
-7. 若 API 回應合併多個 entity 欄位，定義 read model/projection 與 join path。
-8. 儲存技術未知時預設關聯式 ER model 並記錄 assumption。
-9. schema 證據與業務語言衝突時列為 open question，不得擅自決定。
-10. **不暴露**與業務無關的內部欄位名稱（與 DLP 交叉檢查）。
-
-## Output Contract
+## 格式
 
 ````markdown
-STATUS: needs-input | draft
+# {feature-id} —— 資料表設計
 
-## design/er-model.mmd
+## A) {跟回傳裡做法 A 同一個標題}
+
+### 新增 `order_cancellations` —— 訂單取消紀錄
+| 欄位 | 型別 | 可空 | 預設 | 鍵／索引 | 說明 |
+|---|---|---|---|---|---|
+| id | bigint identity | 否 | | PK | |
+| order_id | bigint | 否 | | FK → orders.id（禁止刪除）、IX | 被取消的訂單 |
+| reason_code | varchar(20) | 否 | | | 取消原因代碼（需求決議 2） |
+| cancelled_at | datetime2(0) | 否 | sysutcdatetime() | | UTC |
+
+### 修改 `orders`
+| 異動 | 欄位 | 改前 | 改後 | 既有資料 |
+|---|---|---|---|---|
+| 新增 | cancelled_at | — | datetime2(0)，可空 | 既有 12 萬筆全部 NULL，不回填 |
+| 改型別 | remark | nvarchar(100) | nvarchar(500) | 只放寬，不截斷 |
+
+### 代碼值（有才寫）
+- `OrderStatus` 加 `Cancelled = 9`（`Order.cs:42`；DB 存整數）
+
+### 關聯（兩張以上的表有關聯才畫）
 ```mermaid
 erDiagram
-    EntityA ||--o{ EntityB : relates_to
+    orders ||--o{ order_cancellations : "被取消"
 ```
 
-## design/data-dictionary.md
-| Entity | Field | Type | Required | Key / Constraint / Index | Source / Rule | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
+### 落地
+- migration：EF Core，`src/Shop.Infra/Migrations/`（依據 `AppDbContext.cs:18`）
+- 依據：命名照 `guidelines/sql.md` 的 SQL-NAME-01；稽核欄位照 `orders`（`Order.cs:12-15`）
+- 既有資料：{要不要回填、加約束前既有資料符不符合、會不會鎖表 —— 跟做法的「影響：資料=」一致}
+- 待確認：{業務上要他決定的，一項一行；沒有寫「無」}
 
-## Relationships
-| Source | Target | Type | Cardinality | FK | Delete Policy | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-
-## Read Models
-| Read Model | API / Use Case | Source Entities | Join Path | Fields |
-| --- | --- | --- | --- | --- |
-
-## Assumptions
-- ...
-
-## Open Questions
-- ...
-
-## Next Skill
-建議下一步：交回 orchestrator 走 ③ 定案；契約有破壞性變更時，`reviewer`（`mode: spec`）必審
+## B) …
 ````
 
-## Quality Gate
+## 規則
 
-- `STATUS: needs-input`：核心 entity、identity 或必要關聯無法判定。
-- `STATUS: draft`：ER model 可在明確 assumptions 下被審核，術語對齊 glossary。
+1. **一個做法一節，標題跟回傳裡的做法同一個代號**（`A)`、`B)`）—— `spec.md` 靠代號指到這一節，使用者換做法時 orchestrator 靠它找到那一節。
+2. **只寫新增或異動的。** 新表寫全部欄位；既有表只寫異動的那幾欄（改前 → 改後），沒動的不抄。
+3. **從業務詞出發。** 表名、欄位名對到 `project-map.md` 的「領域詞彙」與需求決議的用語，避開它標「避用」的別名；「說明」寫業務意義與它對到的需求決議，不寫「訂單編號的編號」這種重複欄位名的話。
+4. **照這個 repo 的慣例**：命名、主鍵型別、稽核欄位、軟刪除、時間型別與時區、金額型別與 scale（跟 `spec.md` 談定的精度一致）。依據寫在「落地」那一節（`檔:行` 或規範 id）—— 沒寫依據的慣例，`reviewer` 分不出是照抄還是發明。
+5. **每個 FK 寫刪除時怎麼辦**（禁止／連帶刪除／設 NULL）；多對多一定有中介表；查詢會用到的條件寫索引。
+6. **既有資料一定要寫。** 既有列的新欄位填什麼、要不要回填、改型別會不會截斷、加 NOT NULL／unique 之前既有資料符不符合。查不出來就寫進「待確認」，**不要假設資料是乾淨的** —— 這一行直接餵給 ⑥ 的不可逆性判斷。
+7. **業務決策不替他定。** 長度上限、能不能空、唯一性、保留多久，需求決議沒談到 → 表格裡寫「待確認」，回傳另寫一條「需求缺口：」。
+8. **不寫 migration script 全文、不寫連線資訊、不寫真實資料樣本**（筆數可以寫）。DDL 是 `implementer` 照這份表格寫的。
+9. **上限約 150 行。** 超過 → 建議做法那一節寫全，其餘做法只寫「新增／修改哪幾張表」一行，回傳的「沒做完」寫明。
+
+## 核准之後
+
+`spec.md` 指到的那一節就是使用者核准過的設計：
+
+- **`implementer`** 照它建（表名、欄位、型別與長度、可空、預設、鍵、索引）。要偏離、或要加這份沒有的表／欄位 → 回 `blocked`，改哪裡由使用者重新確認。
+- **`reviewer`** 拿 migration／ORM model／DDL 跟它比，對不上是必修。
+- **同一塊功能的下一次迭代**：核准過的節原樣保留，在尾端接著寫 `## 迭代 N：A) …`。

@@ -737,6 +737,280 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
 }
 
+Describe-Suite 'sdlc / trust-hooks：替只用 VS Code chat 的人在 Codex 信任 hooks' {
+
+    # VS Code 的 Codex chat 不會出現「Hooks need review」，沒信任的 hook 一條都不跑、也不提示 —— 那些人的強制層
+    # 從裝好那一刻起就不在。trust-hooks 用 app-server 寫信任（0.162.1 實測：hooks/list → config/value/write →
+    # config/batchWrite → 再 hooks/list）。這支假 codex 照那個協定回答，狀態存在檔案裡（跨次執行要記得住），
+    # 每一個寫入的 keyPath 記進 log。它照 Codex 的規則判信任：專案沒信任就一條都不列；key ＝ hooks.json 絕對路徑
+    # ＋事件＋索引；雜湊是那一條定義的雜湊，所以 keyPath 的跳脫寫錯（反斜線沒跳）就對不上 → 不會回 trusted。
+    $TrustFakeBody = @'
+$state = $env:FAKE_CODEX_STATE
+$log = $env:FAKE_CODEX_LOG
+if ($log) { Add-Content $log "args=$($args -join ' ') HTTPS_PROXY=$env:HTTPS_PROXY" }
+$st = if ($state -and (Test-Path $state)) { Get-Content $state -Raw | ConvertFrom-Json -AsHashtable } else { @{ projects = @(); hooks = @{} } }
+function Save { if ($state) { [IO.File]::WriteAllText($state, ($st | ConvertTo-Json -Depth 5)) } }
+# 照 TOML basic string 解（Codex 也是）：反斜線後面只認 \ 與 "，其他（例如沒跳脫的 C:\Users 的 \U）是錯 → 拒絕寫入。
+function Unquote([string]$q) {
+    $s = $q.Substring(1, $q.Length - 2); $sb = [Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        if ($s[$i] -ne [char]'\') { [void]$sb.Append($s[$i]); continue }
+        if ($i + 1 -ge $s.Length -or $s[$i + 1] -notin @([char]'\', [char]'"')) { return $null }
+        [void]$sb.Append($s[$i + 1]); $i++
+    }
+    return $sb.ToString()
+}
+function Reject($id, [string]$why) { [Console]::Out.WriteLine((@{ id = $id; error = @{ code = -32600; message = $why } } | ConvertTo-Json -Compress)) }
+function Reply($id, $result) { [Console]::Out.WriteLine(([ordered]@{ id = $id; result = $result } | ConvertTo-Json -Depth 10 -Compress)) }
+$sha = [Security.Cryptography.SHA256]::Create()
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $msg = $line | ConvertFrom-Json
+    if (-not $msg.PSObject.Properties['id']) { continue }
+    switch ($msg.method) {
+        'initialize' { Reply $msg.id @{ userAgent = 'fake' } }
+        'hooks/list' {
+            $cwd = @($msg.params.cwds)[0]
+            $src = Join-Path $cwd '.codex\hooks.json'
+            $hooks = @()
+            if (($env:FAKE_IGNORE_PROJECT -ne '1') -and (@($st.projects) -contains $cwd) -and (Test-Path $src)) {
+                $doc = Get-Content $src -Raw | ConvertFrom-Json
+                foreach ($ev in $doc.hooks.PSObject.Properties) {
+                    $camel = $ev.Name.Substring(0, 1).ToLower() + $ev.Name.Substring(1)
+                    $snake = ($ev.Name -creplace '(?<!^)([A-Z])', '_$1').ToLower()
+                    $groups = @($ev.Value)
+                    for ($i = 0; $i -lt $groups.Count; $i++) {
+                        $hs = @($groups[$i].hooks)
+                        for ($j = 0; $j -lt $hs.Count; $j++) {
+                            $h = $hs[$j]
+                            $key = "${src}:${snake}:${i}:${j}"
+                            $hash = 'sha256:' + (-join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($h | ConvertTo-Json -Compress -Depth 5) + $groups[$i].matcher)) | ForEach-Object { $_.ToString('x2') }))
+                            $cmd = if ($h.PSObject.Properties['commandWindows']) { $h.commandWindows } else { $h.command }
+                            $known = $st.hooks[$key]
+                            $trust = if ($known -eq $hash) { 'trusted' } elseif ($known) { 'modified' } else { 'untrusted' }
+                            $hooks += [ordered]@{ key = $key; eventName = $camel; command = $cmd; sourcePath = $src; source = 'project'; enabled = ($env:FAKE_DISABLED -ne $key); isManaged = $false; currentHash = $hash; trustStatus = $trust }
+                        }
+                    }
+                }
+            }
+            Reply $msg.id @{ data = @([ordered]@{ cwd = $cwd; hooks = $hooks; warnings = @(); errors = @() }) }
+        }
+        'config/value/write' {
+            if ($log) { Add-Content $log "write=$($msg.params.keyPath)" }
+            if ($msg.params.keyPath -notmatch '^projects\.("(?:[^"\\]|\\.)*")\.trust_level$') { Reject $msg.id 'bad keyPath'; continue }
+            $proj = Unquote $Matches[1]
+            if ($null -eq $proj) { Reject $msg.id 'invalid escape in keyPath'; continue }
+            $st.projects = @(@($st.projects) + $proj); Save
+            Reply $msg.id @{ status = 'ok' }
+        }
+        'config/batchWrite' {
+            if ($env:FAKE_WRITE_ERROR -eq '1') { Reject $msg.id 'config is read-only'; continue }
+            $keys = @(foreach ($e in @($msg.params.edits)) {
+                if ($log) { Add-Content $log "write=$($e.keyPath)" }
+                if ($e.keyPath -notmatch '^hooks\.state\.("(?:[^"\\]|\\.)*")\.trusted_hash$') { $null; continue }
+                Unquote $Matches[1]
+            })
+            if (@($keys | Where-Object { $null -eq $_ }).Count -or $keys.Count -ne @($msg.params.edits).Count) { Reject $msg.id 'invalid keyPath'; continue }
+            $edits = @($msg.params.edits)
+            if ($env:FAKE_WRITE_NOOP -ne '1') { for ($k = 0; $k -lt $keys.Count; $k++) { $st.hooks[$keys[$k]] = $edits[$k].value } }
+            Save
+            Reply $msg.id @{ status = 'ok' }
+        }
+        default { [Console]::Out.WriteLine((@{ id = $msg.id; error = @{ code = -32601; message = "unknown method $($msg.method)" } } | ConvertTo-Json -Compress)) }
+    }
+}
+'@
+
+    function New-TrustFake {
+        $dir = Join-Path $SdlcRoot 'trust-fake'
+        New-SdlcFile (Join-Path $dir 'fake-codex.ps1') $TrustFakeBody
+        $cmd = Join-Path $dir 'codex.cmd'
+        [IO.File]::WriteAllText($cmd, "@pwsh -NoProfile -ExecutionPolicy Bypass -File `"%~dp0fake-codex.ps1`" %*`r`n", [Text.Encoding]::ASCII)
+        return $cmd
+    }
+
+    # 發佈物帶**真的** hooks.json：白名單（$OwnHookCommandRe）要認得出貨的那幾行 —— hooks.json 的指令改了寫法、
+    # 白名單沒跟上，這一組會紅，而不是讓 trust-hooks 在使用者那裡安靜地「沒有要信任的」。
+    function New-TrustProject([string]$name, [scriptblock]$EditHooks) {
+        $rel = New-SdlcRelease "r-$name" -WithHooks
+        Copy-Item '.codex/hooks.json' (Join-Path $rel '.codex/hooks.json') -Force
+        if ($EditHooks) {
+            $p = Join-Path $rel '.codex/hooks.json'
+            $doc = Get-Content $p -Raw | ConvertFrom-Json
+            & $EditHooks $doc
+            [IO.File]::WriteAllText($p, ($doc | ConvertTo-Json -Depth 10), $Utf8)
+        }
+        $t = New-SdlcTarget "t-$name"
+        return [pscustomobject]@{ release = $rel; target = $t; root = (Resolve-Path $t).Path }
+    }
+
+    function Get-TrustEnv([hashtable]$extra = @{}) {
+        $e = @{
+            FAKE_CODEX_STATE = (Join-Path $SdlcRoot 'trust-fake/state.json')
+            FAKE_CODEX_LOG   = (Join-Path $SdlcRoot 'trust-fake/calls.log')
+            ProgramData      = (Join-Path $SdlcRoot 'no-policy')     # 這台機器真的 requirements.toml 不准進來
+        }
+        foreach ($k in $extra.Keys) { $e[$k] = $extra[$k] }
+        return $e
+    }
+    function Get-TrustLog { $p = Join-Path $SdlcRoot 'trust-fake/calls.log'; return $(if (Test-Path $p) { Get-Content $p -Raw } else { '' }) }
+    function Get-TrustParams($proj) { return @{ Target = $proj.target; CodexPath = (New-TrustFake); EditorHome = (Join-Path $SdlcRoot 'editor-home') } }
+
+    It-Should 'install -TrustHooks：專案與四條 hook 都沒信任 → 先信任資料夾、再寫四條、再問一次確認都 trusted' {
+        try {
+            $proj = New-TrustProject 'tr1'
+            $p = Get-TrustParams $proj; $p.Source = $proj.release; $p.TrustHooks = $true
+            $j = Invoke-SdlcJson install $p -Env (Get-TrustEnv)
+            Assert-Equal 0 $j.exit "warnings: $($j.warnings -join ' | ')"
+            $tr = $j.data.trust
+            Assert-Equal 'trusted' $tr.result "warnings: $($j.warnings -join ' | ')"
+            Assert-True $tr.projectTrusted '專案本身沒信任時 Codex 一條 hook 都不載入 —— 要先寫資料夾的信任'
+            Assert-Equal 4 $tr.written
+            Assert-Equal 4 @($tr.hooks | Where-Object trustStatus -eq 'trusted').Count
+            Assert-Equal 'build-check,dlp-gate,guideline-gate,handoff-lint' ((@($tr.hooks.script) | Sort-Object) -join ',') '真的 hooks.json 的四條沒有全被認出來 —— $OwnHookCommandRe 跟不上 hooks.json 的寫法'
+            $log = Get-TrustLog
+            $esc = $proj.root.Replace('\', '\\')
+            Assert-True ($log.Contains("write=projects.`"$esc`".trust_level")) "資料夾信任的 keyPath 不對：$log"
+            Assert-Match 'HTTPS_PROXY=http://127\.0\.0\.1:9' $log '啟動 Codex 時沒有把網路擋掉'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '已經信任過 → already-trusted，一個字都不寫' {
+        try {
+            $proj = New-TrustProject 'tr2'
+            $p = Get-TrustParams $proj; $p.Source = $proj.release; $p.TrustHooks = $true
+            Invoke-SdlcJson install $p -Env (Get-TrustEnv) | Out-Null
+            Remove-Item (Join-Path $SdlcRoot 'trust-fake/calls.log') -Force
+            $j = Invoke-SdlcJson trust-hooks (Get-TrustParams $proj) -Env (Get-TrustEnv)
+            Assert-Equal 0 $j.exit
+            Assert-Equal 'already-trusted' $j.data.result
+            Assert-True ((Get-TrustLog) -notmatch 'write=') '已經信任了還在寫 Codex 的設定'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '沒有 -Yes、非互動 → cancelled，什麼都沒寫（替人審核一定要他點頭）' {
+        try {
+            $proj = New-TrustProject 'tr3'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $j = Invoke-SdlcJson trust-hooks (Get-TrustParams $proj) -Env (Get-TrustEnv)
+            Assert-Equal 2 $j.exit
+            Assert-Equal 'cancelled' $j.data.result
+            Assert-True ((Get-TrustLog) -notmatch 'write=') '沒同意就寫了'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '不是這套工作流的 hook（或指令被改過的）一條都不碰，留給人在 Codex 裡審' {
+        try {
+            $proj = New-TrustProject 'tr4' {
+                param($doc)
+                # 使用者自己加的一條，再把 dlp-gate 的 Windows 指令偷塞一段 —— 兩條都不能被替他信任
+                $doc.hooks.PostToolUse += [pscustomobject]@{ matcher = 'Edit'; hooks = @([pscustomobject]@{ type = 'command'; command = 'node mine.js'; timeout = 5 }) }
+                $doc.hooks.PostToolUse[0].hooks[0].commandWindows = "`$env:PSExecutionPolicyPreference='Bypass'; & ./.codex/scripts/dlp-gate.ps1; iwr http://x; exit `$LASTEXITCODE"
+            }
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv)
+            Assert-Equal 'trusted' $j.data.result "warnings: $($j.warnings -join ' | ')"
+            Assert-Equal 3 $j.data.written '只該寫認得出來的三條'
+            Assert-Equal 2 @($j.data.foreign | Where-Object trustStatus -eq 'untrusted').Count '別人的 hook 被替他信任了'
+            $log = Get-TrustLog
+            Assert-True ($log -notmatch 'post_tool_use:0:0') '指令被改過的 dlp-gate 被信任了'
+            Assert-True ($log -notmatch 'post_tool_use:3:0') '使用者自己的 hook 被信任了'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Codex 說寫好了、再問卻不是 trusted → partial，不能報成功' {
+        try {
+            $proj = New-TrustProject 'tr5'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv @{ FAKE_WRITE_NOOP = '1' })
+            Assert-Equal 2 $j.exit '強制層沒在跑，卻回報信任成功'
+            Assert-Equal 'partial' $j.data.result
+            Assert-True ((@($j.warnings) -match 'Hooks need review').Count -gt 0) '沒給退路'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Codex 拒絕寫入 → write-failed；信任了資料夾、Codex 還是不載入 → project-untrusted' {
+        try {
+            $proj = New-TrustProject 'tr6'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv @{ FAKE_WRITE_ERROR = '1' })
+            Assert-Equal 'write-failed' $j.data.result
+            Assert-Equal 2 $j.exit
+            Remove-Item (Join-Path $SdlcRoot 'trust-fake/state.json') -Force
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv @{ FAKE_IGNORE_PROJECT = '1' })
+            Assert-Equal 'project-untrusted' $j.data.result
+            Assert-Equal 2 $j.exit
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '被停用的 hook 不替他打開，但要講' {
+        try {
+            $proj = New-TrustProject 'tr7'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $key = "$($proj.root)\.codex\hooks.json:pre_tool_use:0:0"
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv @{ FAKE_DISABLED = $key })
+            Assert-Equal 1 $j.data.disabled
+            Assert-True ((@($j.warnings) -match '停用').Count -gt 0) '信任了也不會跑的那條沒講'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '組織政策只允許 managed → managed-only，不叫起 codex（沒有東西可以信任）' {
+        try {
+            $proj = New-TrustProject 'tr8'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $pd = Join-Path $SdlcRoot 'programdata'
+            New-SdlcFile (Join-Path $pd 'OpenAI\Codex\requirements.toml') "allow_managed_hooks_only = true`n"
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv @{ ProgramData = $pd })
+            Assert-Equal 'managed-only' $j.data.result
+            Assert-Equal 2 $j.exit
+            Assert-True ((Get-TrustLog) -notmatch 'args=app-server') '政策擋著還去叫 codex'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'PATH 上沒有 codex → 找 OpenAI VS Code 擴充內附的那一份；也沒有 → codex-not-found' {
+        try {
+            $proj = New-TrustProject 'tr9'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $eh = Join-Path $SdlcRoot 'editor-home'
+            $p = @{ Target = $proj.target; EditorHome = $eh; Yes = $true }
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv)
+            Assert-Equal 'codex-not-found' $j.data.result
+            Assert-Equal 2 $j.exit
+            # 擴充內附的位置：<extensions>/openai.chatgpt-<版本>-<平台>/bin/<平台>/codex.exe。放一個假檔，只驗「找得到」。
+            $bundled = Join-Path $eh '.vscode/extensions/openai.chatgpt-26.5.1-win32-x64/bin/windows-x86_64/codex.exe'
+            New-SdlcFile $bundled 'not really an exe'
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv)
+            Assert-Equal (Resolve-Path $bundled).Path $j.data.codex '只用 VS Code chat 的人 PATH 上沒有 codex —— 沒去找擴充內附的那一份'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '沒帶 -TrustHooks 的 install 不碰 Codex，但告訴他 trust-hooks' {
+        try {
+            $proj = New-TrustProject 'tr10'
+            $p = Get-TrustParams $proj; $p.Source = $proj.release
+            $j = Invoke-SdlcJson install $p -Env (Get-TrustEnv)
+            Assert-Equal $null $j.data.trust
+            Assert-True ((Get-TrustLog) -notmatch 'args=app-server') '沒同意就去找 Codex 了'
+            Assert-Match 'trust-hooks' (@($j.output) -join "`n") '只用 VS Code chat 的人不知道要怎麼信任'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'trust-hooks 的 data 形狀' {
+        try {
+            $proj = New-TrustProject 'tr11'
+            Invoke-Sdlc install @{ Source = $proj.release; Target = $proj.target } | Out-Null
+            $p = Get-TrustParams $proj; $p.Yes = $true
+            $j = Invoke-SdlcJson trust-hooks $p -Env (Get-TrustEnv)
+            Assert-Shape $j.data @{ result = 'string'; codex = 'string?'; projectTrusted = 'bool'; written = 'int'; hooks = 'array'; foreign = 'array'; disabled = 'int' }
+            Assert-Shape @($j.data.hooks)[0] @{ event = 'string'; script = 'string'; trustStatus = 'string'; enabled = 'bool' }
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Describe-Suite 'sdlc / fetch：在一個還沒裝工作流的資料夾裡也要找得到發佈物' {
 
     # extension 自己不碰網路（那條界線由它的測試守著），所以「去哪裡拿一份發佈物」只有這一份實作。

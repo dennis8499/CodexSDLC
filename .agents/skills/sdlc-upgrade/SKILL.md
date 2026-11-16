@@ -67,5 +67,5 @@ pwsh <path>/.codex/scripts/sdlc.ps1 update -Target . -Yes -Json
 
 - `data.from` → `data.to`；`data.backup` 有值就說備份在哪。
 - **這個對話還在用舊的 AGENTS.md** —— 新規則從下一個 Codex 對話才生效，請他開新對話再繼續原本的工作。
-- `data.hooksChanged` 為真 → 重開 codex，出現「Hooks need review」時選 Trust all，不然強制層一條都不跑。
+- `data.hooksChanged` 為真 → hooks 要重新信任，不然強制層一條都不跑。請他**自己**在終端機跑 `pwsh .codex/scripts/sdlc.ps1 trust-hooks`（或在 VS Code extension 按「在 Codex 信任 hooks」），然後開新對話 —— 信任寫的是他的 `~/.codex/config.toml`，不要在這個對話裡替他跑。
 - `data.editor.mismatch` 為真且 `data.editor.vsix` 有值 → VS Code extension 還是舊版；給他 `code --install-extension "<vsix>" --force`，**問過才跑**（它是整台機器共用的），裝完要重新載入視窗。

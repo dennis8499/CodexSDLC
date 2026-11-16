@@ -31,7 +31,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'update', 'check-update', 'apply', 'set', 'tune', 'doctor', 'whatsnew', 'fetch', 'models', 'learn', 'managed-hooks')]
+    [ValidateSet('install', 'update', 'check-update', 'apply', 'set', 'tune', 'doctor', 'whatsnew', 'fetch', 'models', 'learn', 'managed-hooks', 'trust-hooks')]
     [string]$Command = 'doctor',
 
     [string]$Source,                       # 發佈物根目錄；預設 = 本腳本所在的工作流根
@@ -53,6 +53,7 @@ param(
     [switch]$NoRemote,                     # fetch 用：只認本機那一份，一條連線都不開
     [string]$CodexPath,                    # doctor -CheckHookTrust 用：codex 執行檔（預設找 PATH）
     [switch]$CheckHookTrust,               # doctor 用：另外叫起 codex 問 hooks 的信任狀態（預設不問，見 Get-HookTrust）
+    [switch]$TrustHooks,                   # install／update 用：裝完順便替你在 Codex 信任這套工作流的 hooks（= 同意 trust-hooks 寫 ~/.codex/config.toml）
     [string]$OutDir,                       # managed-hooks 用：部署包寫到哪個資料夾
     [string]$ManagedDir = 'C:\enterprise\hooks',   # managed-hooks 用：requirements.toml 的 windows_managed_dir
     [string]$UnixManagedDir = '/enterprise/hooks', # managed-hooks 用：requirements.toml 的 managed_dir（macOS／Linux）
@@ -643,13 +644,41 @@ function Invoke-Lint([string]$root) {
 # 信任狀態只有 Codex 自己知道（雜湊怎麼算是它的實作），所以這裡**問它**（`codex app-server` 的 `hooks/list`），不自己算。
 # 啟動 app-server 時它會去連 chatgpt.com 與 github.com（實測），所以子行程的 proxy 一律指向一個一定連不上的位址 ——
 # doctor 從構造上就碰不到網路，不靠 Codex 哪一版剛好沒有連。
-function Resolve-Codex {
+#
+# -IncludeEditor：PATH 上沒有 codex 時，再找 OpenAI 的 VS Code 擴充（openai.chatgpt）內附的那一份 ——
+# 只用 VS Code 的 Codex chat、從沒裝過 CLI 的人，PATH 上就是沒有 codex，而信任要靠它寫。
+# 只給信任相關的兩條路用（trust-hooks、doctor -CheckHookTrust）：環境檢查與 models 照舊只看 PATH／-CodexPath。
+# 內附的位置（extension 目錄底下的 bin/）是推的、沒有在裝了 OpenAI 擴充的機器上看過（docs/maintainers.md 有記）。
+function Resolve-Codex([switch]$IncludeEditor) {
     if ($CodexPath) { return $(if (Test-Path $CodexPath) { (Resolve-Path $CodexPath).Path } else { $null }) }
     $c = Get-Command codex -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    return $(if ($c) { $c.Source } else { $null })
+    if ($c) { return $c.Source }
+    if ($IncludeEditor) { return Find-EditorBundledCodex }
+    return $null
 }
 
-function Invoke-CodexHooksList([string]$codex, [string]$cwd, [int]$timeoutMs = 15000) {
+function Find-EditorBundledCodex {
+    $names = if ($IsWindows -or $env:OS -eq 'Windows_NT') { @('codex.exe') } else { @('codex') }
+    $dirs = @(foreach ($e in $Editors) {
+        $root = Join-Path $EditorHome "$($e.dir)/extensions"
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            Get-ChildItem -LiteralPath $root -Directory -Filter 'openai.chatgpt-*' -ErrorAction SilentlyContinue
+        }
+    })
+    foreach ($d in @($dirs | Sort-Object LastWriteTimeUtc -Descending)) {
+        $bin = Join-Path $d.FullName 'bin'
+        if (-not (Test-Path -LiteralPath $bin -PathType Container)) { continue }
+        $hit = Get-ChildItem -LiteralPath $bin -Recurse -File -Depth 2 -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -in $names } | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# 一個 app-server 行程上連續發幾個請求（trust-hooks 要「查 → 寫 → 再查」，每一步都起一個新的 codex 太慢）。
+# id 從 2 起跳：initialize 是 1，doctor 的 hooks/list 一向是 2（測試的假 codex 認這個）。
+# 讀到一半逾時就整個 session 作廢 —— 那一個 ReadLineAsync 還掛著，同一條 stream 不能再讀。
+function Start-CodexAppServer([string]$codex, [string]$cwd) {
     $psi = [Diagnostics.ProcessStartInfo]::new($codex)
     $psi.ArgumentList.Add('app-server')
     $psi.WorkingDirectory       = $cwd
@@ -662,32 +691,53 @@ function Invoke-CodexHooksList([string]$codex, [string]$cwd, [int]$timeoutMs = 1
     $psi.StandardErrorEncoding  = $Utf8NoBom
     foreach ($k in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')) { $psi.Environment[$k] = 'http://127.0.0.1:9' }
     foreach ($k in @('NO_PROXY', 'no_proxy')) { [void]$psi.Environment.Remove($k) }
-    $p = $null
     try {
         $p = [Diagnostics.Process]::Start($psi)
         $null = $p.StandardError.ReadToEndAsync()          # 不讀的話它的 log 寫滿管線就卡住
-        $init = [ordered]@{ id = 1; method = 'initialize'; params = [ordered]@{ clientInfo = [ordered]@{ name = 'codex-sdlc-doctor'; title = $null; version = '1' }; capabilities = $null } }
+        $init = [ordered]@{ id = 1; method = 'initialize'; params = [ordered]@{ clientInfo = [ordered]@{ name = 'codex-sdlc'; title = $null; version = '1' }; capabilities = $null } }
         $p.StandardInput.WriteLine(($init | ConvertTo-Json -Depth 5 -Compress))
         $p.StandardInput.WriteLine('{"method":"initialized","params":{}}')
-        $p.StandardInput.WriteLine(([ordered]@{ id = 2; method = 'hooks/list'; params = [ordered]@{ cwds = @($cwd) } } | ConvertTo-Json -Depth 5 -Compress))
+        $p.StandardInput.Flush()
+        return [pscustomobject]@{ process = $p; next = 2; broken = $false }
+    } catch { return $null }
+}
+
+function Invoke-AppServerRequest($session, [string]$method, $params, [int]$timeoutMs = 15000) {
+    if (-not $session -or $session.broken) { return $null }
+    $id = $session.next; $session.next++
+    $p = $session.process
+    try {
+        $p.StandardInput.WriteLine(([ordered]@{ id = $id; method = $method; params = $params } | ConvertTo-Json -Depth 8 -Compress))
         $p.StandardInput.Flush()
         $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
         while ($true) {
             $left = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
-            if ($left -le 0) { return $null }
+            if ($left -le 0) { $session.broken = $true; return $null }
             $t = $p.StandardOutput.ReadLineAsync()
-            if (-not $t.Wait([int][Math]::Ceiling($left))) { return $null }
+            if (-not $t.Wait([int][Math]::Ceiling($left))) { $session.broken = $true; return $null }
             $line = $t.Result
-            if ($null -eq $line) { return $null }
+            if ($null -eq $line) { $session.broken = $true; return $null }
             $msg = $null
             try { $msg = $line | ConvertFrom-Json } catch { continue }
-            if ($msg -and $msg.PSObject.Properties['id'] -and $msg.id -eq 2) { return $msg }
+            if ($msg -and $msg.PSObject.Properties['id'] -and $msg.id -eq $id) { return $msg }
         }
     } catch {
+        $session.broken = $true
         return $null
-    } finally {
-        if ($p) { try { if (-not $p.HasExited) { $p.Kill($true) } } catch { }; $p.Dispose() }
     }
+}
+
+function Stop-CodexAppServer($session) {
+    if (-not $session) { return }
+    $p = $session.process
+    try { if (-not $p.HasExited) { $p.Kill($true) } } catch { }
+    $p.Dispose()
+}
+
+function Invoke-CodexHooksList([string]$codex, [string]$cwd, [int]$timeoutMs = 15000) {
+    $s = Start-CodexAppServer $codex $cwd
+    try { return Invoke-AppServerRequest $s 'hooks/list' ([ordered]@{ cwds = @($cwd) }) $timeoutMs }
+    finally { Stop-CodexAppServer $s }
 }
 
 # ---- 組織政策：只允許管理員部署的 hooks ----
@@ -715,7 +765,7 @@ function Get-HookTrust([string]$target) {
     # doctor 的收尾會告訴你這個參數在哪。
     # **檔在不在照查** —— hooks.json 不見是工具檔缺了，不是信任問題，而那一條有得修（補回工具檔）。
     if (-not $CheckHookTrust) { return [ordered]@{ status = 'skipped'; codex = $null; policy = $policy } }
-    $codex = Resolve-Codex
+    $codex = Resolve-Codex -IncludeEditor
     if (-not $codex) { return [ordered]@{ status = 'unknown'; reason = 'codex-not-found'; codex = $null; policy = $policy } }
 
     $root = (Resolve-Path $target).Path
@@ -724,9 +774,7 @@ function Get-HookTrust([string]$target) {
         return [ordered]@{ status = 'unknown'; reason = $(if ($msg -and $msg.error) { 'query-failed' } else { 'no-response' }); codex = $codex; policy = $policy }
     }
 
-    $want = ((Resolve-Path $hooksFile).Path -replace '\\', '/').ToLowerInvariant()
-    $mine = @($msg.result.data | ForEach-Object { @($_.hooks) } |
-              Where-Object { $_ -and ([string]$_.sourcePath -replace '\\', '/').ToLowerInvariant() -eq $want })
+    $mine = @(Get-ProjectHookEntries $msg $hooksFile)
     $counts = [ordered]@{
         total     = $mine.Count
         trusted   = @($mine | Where-Object { $_.trustStatus -in @('trusted', 'managed') -and $_.enabled -ne $false }).Count
@@ -772,11 +820,11 @@ function Show-HookTrust($trust) {
             if ($c.untrusted) { $parts += "$($c.untrusted) 條未信任" }
             if ($c.modified)  { $parts += "$($c.modified) 條改過、待重新審核" }
             if ($c.disabled)  { $parts += "$($c.disabled) 條被停用" }
-            Warn "Codex 還沒信任這個專案的 hooks（$($parts -join '、')）—— 沒信任的那幾條（handoff-lint／dlp-gate／guideline-gate／build-check）一次都不會跑，而且不會有任何提示。在專案裡開 codex，出現「Hooks need review」時選 Trust all and continue。"
+            Warn "Codex 還沒信任這個專案的 hooks（$($parts -join '、')）—— 沒信任的那幾條（handoff-lint／dlp-gate／guideline-gate／build-check）一次都不會跑，而且不會有任何提示。$TrustHint"
             return 1
         }
         'project-untrusted' {
-            Warn 'Codex 還沒信任這個專案 —— 專案層的 .codex/config.toml 與 hooks 整個停用，機械強制層一條都不會跑。在專案裡開 codex，信任這個資料夾，接著在「Hooks need review」選 Trust all and continue。資料夾已經信任、卻從來沒出現過「Hooks need review」的話，多半是組織政策只允許管理員部署的 hooks（雲端下發的政策這裡看不到）—— 見 sdlc.ps1 managed-hooks。'
+            Warn "Codex 還沒信任這個專案 —— 專案層的 .codex/config.toml 與 hooks 整個停用，機械強制層一條都不會跑。$TrustHint 資料夾已經信任、卻從來沒出現過「Hooks need review」的話，多半是組織政策只允許管理員部署的 hooks（雲端下發的政策這裡看不到）—— 見 sdlc.ps1 managed-hooks。"
             return 1
         }
         'managed-only' { Show-ManagedOnlyPolicy $trust.policy; return 1 }
@@ -800,12 +848,12 @@ function Show-HookTrust($trust) {
             # 政策檔讀得到就照講 —— 不必叫起 codex，而「去按信任」在這種環境是錯的修法。
             if ($trust.policy.managedOnly -and $trust.policy.ours.Count -lt $HookScriptNames.Count) { Show-ManagedOnlyPolicy $trust.policy; return 1 }
             if ($trust.policy.managedOnly) { Say "組織政策只允許管理員部署的 hooks（$($trust.policy.path)），而它登記了這套工作流的四支 —— 不必按信任。要確認 Codex 真的載入了：doctor -CheckHookTrust。"; return 0 }
-            Say 'Codex hooks 的信任狀態：這次沒查（要查：doctor -CheckHookTrust，它會另外叫起一次 codex）。沒信任的 hook 一條都不會跑，而且不會提示。'
+            Say 'Codex hooks 的信任狀態：這次沒查（要查：doctor -CheckHookTrust，它會另外叫起一次 codex）。沒信任的 hook 一條都不會跑，而且不會提示 —— 要直接信任：sdlc.ps1 trust-hooks。'
             return 0
         }
         'unknown' {
             $why = if ($trust.reason -eq 'codex-not-found') { '找不到 codex 執行檔' } else { '問 codex 沒有得到回應' }
-            Say "無法確認 Codex 是否信任了這個專案的 hooks（$why）。信任狀態只有 Codex 自己知道：開 codex 時若出現「Hooks need review」，要選 Trust all and continue，否則強制層不會跑。"
+            Say "無法確認 Codex 是否信任了這個專案的 hooks（$why）。信任狀態只有 Codex 自己知道；沒信任的話強制層不會跑。$TrustHint"
             return 0
         }
         # 檔不在 = 機械強制層整層不存在，而且沒有任何跡象。這裡不自己產生一份：內容屬於發佈物
@@ -819,6 +867,190 @@ function Show-HookTrust($trust) {
     }
 }
 
+# ---- 替使用者信任 hooks：trust-hooks（4.28.0）----
+#
+# 「Hooks need review」只出現在終端機的 Codex。只用 VS Code 的 Codex chat 的人永遠看不到它，而沒信任的 hook
+# 一條都不跑、也不提示 —— 那些人的強制層從裝好那一刻起就不在。所以這裡用 Codex 自己的 app-server 寫信任
+# （0.162.1 實測，隔離的 CODEX_HOME）：
+#   1. hooks/list 列不出這個專案的 hooks = 專案本身沒信任 → config/value/write `projects."<專案>".trust_level = "trusted"`
+#   2. hooks/list 的每一條帶 key 與 currentHash → config/batchWrite `hooks.state."<key>".trusted_hash = currentHash`
+#   3. 再 hooks/list 一次：每一條都回 trusted 才算數（寫成功不等於 Codex 認）
+# 雜湊不自己算（拿 Codex 回的 currentHash），config.toml 也不自己改（app-server 寫它自己的）—— 跟在終端機按
+# Trust all 寫的是同一個地方、同一個值。
+#
+# 這等於替使用者做了一次審核，所以**只信任這套工作流自己的那幾條**：Codex 列出來的 command 逐字是 hooks.json
+# 出貨的兩種寫法之一、指向 .codex/scripts 底下那四支腳本。其他的（使用者自己加的、指令被改過的）一條都不碰，
+# 留給人在 Codex 裡審。腳本**內容**本來就不在 Codex 的信任範圍裡（改 .ps1 不會讓信任失效，版本檔 v48-enforcement），
+# 所以「指令指向我們的腳本」就是 Codex 的審核在這裡能保證的全部。
+# hooks.json 的指令一改寫法，這條就認不得 —— test-sdlc.ps1 拿真的 hooks.json 跑一次 trust-hooks 守著。
+$OwnHookCommandRe = '^(?:pwsh -NoProfile -ExecutionPolicy Bypass -File \.codex/scripts/(?<n>handoff-lint|dlp-gate|guideline-gate|build-check)\.ps1|\$env:PSExecutionPolicyPreference=''Bypass''; & \./\.codex/scripts/(?<n>handoff-lint|dlp-gate|guideline-gate|build-check)\.ps1; exit \$LASTEXITCODE)$'
+$TrustHint = '要信任：跑 pwsh .codex/scripts/sdlc.ps1 trust-hooks（VS Code 的 Codex chat 不會出現審核畫面，用這個）；或在終端機的專案目錄開 codex，出現「Hooks need review」時選 Trust all and continue。'
+
+function Get-OwnHookScript([string]$command) {
+    $m = [regex]::Match($command, $OwnHookCommandRe)
+    return $(if ($m.Success) { $m.Groups['n'].Value } else { $null })
+}
+
+# config 的 keyPath 一段：雙引號、反斜線與引號跳脫（實測 Codex 照 TOML basic string 解，寫出來是單引號的 literal key）。
+function ConvertTo-ConfigKeySegment([string]$s) { return '"' + $s.Replace('\', '\\').Replace('"', '\"') + '"' }
+
+function Get-ProjectHookEntries($listMsg, [string]$hooksFile) {
+    $want = ((Resolve-Path -LiteralPath $hooksFile).Path -replace '\\', '/').ToLowerInvariant()
+    return @($listMsg.result.data | ForEach-Object { @($_.hooks) } |
+             Where-Object { $_ -and ([string]$_.sourcePath -replace '\\', '/').ToLowerInvariant() -eq $want })
+}
+
+# hooks.json 自己寫了什麼（還沒信任專案時 Codex 一條都不列，確認畫面只能看檔）。
+# 兩種寫法（command／commandWindows）都要是我們的才算 —— 只看其中一種，另一個平台跑的就是沒人看過的指令。
+function Get-LocalHookEntries([string]$hooksFile) {
+    $doc = Read-JsonFile $hooksFile
+    if (-not $doc -or -not $doc.PSObject.Properties['hooks'] -or -not $doc.hooks) { return @() }
+    return @(foreach ($ev in $doc.hooks.PSObject.Properties) {
+        foreach ($g in @($ev.Value)) {
+            foreach ($h in @($g.hooks)) {
+                if (-not $h) { continue }
+                $cmds = @(foreach ($k in @('command', 'commandWindows')) { if ($h.PSObject.Properties[$k] -and $h.$k) { [string]$h.$k } })
+                $names = @($cmds | ForEach-Object { Get-OwnHookScript $_ } | Sort-Object -Unique)
+                $own = if ($cmds.Count -and $names.Count -eq 1 -and @($cmds | Where-Object { -not (Get-OwnHookScript $_) }).Count -eq 0) { $names[0] } else { $null }
+                [pscustomobject]@{ event = $ev.Name; script = $own; command = $(if ($cmds.Count) { $cmds[-1] } else { '' }) }
+            }
+        }
+    })
+}
+
+function ConvertTo-HookReport($entries) {
+    return @($entries | ForEach-Object {
+        [ordered]@{ event = [string]$_.eventName; script = (Get-OwnHookScript ([string]$_.command)); trustStatus = [string]$_.trustStatus; enabled = ($_.enabled -ne $false) }
+    })
+}
+
+# 回 data：result 是 trusted｜already-trusted｜nothing-to-trust｜cancelled｜no-hooks｜managed-only｜codex-not-found｜
+# no-response｜write-failed｜project-untrusted（寫了專案信任，Codex 還是不載入）｜partial（寫了，再問還有沒信任的）。
+# $consented：install／update 帶 -TrustHooks、或 trust-hooks 帶 -Yes —— 同意已經給了，不再問。
+function Invoke-HookTrustWrite([string]$target, [bool]$consented) {
+    $out = [ordered]@{ result = $null; codex = $null; projectTrusted = $false; written = 0; hooks = @(); foreign = @(); disabled = 0 }
+    $hooksFile = Join-Path $target $HooksRel
+    if (-not (Test-Path -LiteralPath $hooksFile -PathType Leaf)) {
+        $out.result = 'no-hooks'
+        Warn "$HooksRel 不在 —— 沒有 hooks 可以信任。先用發佈物把工具檔補回來（update -Target <這個專案>）。"
+        return $out
+    }
+    $local = @(Get-LocalHookEntries $hooksFile)
+    $localOwn = @($local | Where-Object script)
+    $localForeign = @($local | Where-Object { -not $_.script })
+    if (-not $localOwn.Count) {
+        $out.result = 'nothing-to-trust'
+        Say "$HooksRel 裡沒有這套工作流的 hook，沒有要信任的。"
+        return $out
+    }
+    $policy = Get-ManagedHooksPolicy
+    if ($policy.managedOnly) { $out.result = 'managed-only'; Show-ManagedOnlyPolicy $policy; return $out }
+    $codex = Resolve-Codex -IncludeEditor
+    $out.codex = $codex
+    if (-not $codex) {
+        $out.result = 'codex-not-found'
+        Warn '找不到 codex 執行檔（PATH 上沒有，OpenAI 的 VS Code 擴充裡也沒找到）—— 信任要由 Codex 自己寫，沒有它寫不了。加 -CodexPath <codex 的完整路徑> 再跑一次，或在終端機開 codex，出現「Hooks need review」時選 Trust all and continue。'
+        return $out
+    }
+
+    $root = (Resolve-Path -LiteralPath $target).Path
+    $s = Start-CodexAppServer $codex $root
+    try {
+        $list = Invoke-AppServerRequest $s 'hooks/list' ([ordered]@{ cwds = @($root) })
+        if (-not $list -or -not $list.PSObject.Properties['result'] -or -not $list.result) {
+            $out.result = 'no-response'
+            Warn "問 Codex（$codex app-server）沒有得到回應，什麼都沒寫。在終端機開 codex，出現「Hooks need review」時選 Trust all and continue。"
+            return $out
+        }
+        $mine = @(Get-ProjectHookEntries $list $hooksFile)
+        $needProject = $mine.Count -eq 0
+        $pending = @($mine | Where-Object { (Get-OwnHookScript ([string]$_.command)) -and $_.trustStatus -in @('untrusted', 'modified') })
+        if (-not $needProject -and -not $pending.Count) {
+            $out.result = 'already-trusted'
+            $out.hooks = @(ConvertTo-HookReport @($mine | Where-Object { Get-OwnHookScript ([string]$_.command) }))
+            $out.foreign = @(ConvertTo-HookReport @($mine | Where-Object { -not (Get-OwnHookScript ([string]$_.command)) }))
+            Say "Codex hooks：這套工作流的 $(@($out.hooks).Count) 條都已經信任了，沒有要寫的。"
+            Show-TrustLeftovers $out
+            return $out
+        }
+
+        # 寫之前先講清楚會寫什麼 —— 這一步取代的是 Codex 的審核畫面。
+        Say '要替你在 Codex 信任：'
+        if ($needProject) { Say "  資料夾 $root（Codex 從此載入它的 .codex/config.toml 與 hooks.json）" }
+        $show = if ($needProject) { $localOwn } else { @($pending | ForEach-Object { [pscustomobject]@{ event = $_.eventName; script = (Get-OwnHookScript ([string]$_.command)) } }) }
+        foreach ($h in $show) { Say "  hook  $($h.event) → .codex/scripts/$($h.script).ps1" }
+        if ($localForeign.Count) { Say "不會碰（不是這套工作流的，留給你在 Codex 裡審）：$(@($localForeign | ForEach-Object { "$($_.event) $($_.command)" }) -join '；')" }
+        Say '寫進 Codex 的使用者設定（~/.codex/config.toml，由 codex app-server 自己寫，跟在 Codex 裡按 Trust all 是同一件事）。'
+        if (-not $consented -and -not (Confirm-Step '要替你信任嗎？')) {
+            $out.result = 'cancelled'
+            Say '已取消，什麼都沒寫。'
+            return $out
+        }
+
+        if ($needProject) {
+            $w = Invoke-AppServerRequest $s 'config/value/write' ([ordered]@{ keyPath = "projects.$(ConvertTo-ConfigKeySegment $root).trust_level"; mergeStrategy = 'upsert'; value = 'trusted' })
+            if (-not $w -or -not $w.PSObject.Properties['result'] -or -not $w.result) {
+                $out.result = 'write-failed'
+                Warn "Codex 沒有接受「信任這個資料夾」的寫入$(if ($w -and $w.PSObject.Properties['error']) { "（$($w.error.message)）" })，什麼都沒寫。在終端機開 codex，信任這個資料夾並在「Hooks need review」選 Trust all and continue。"
+                return $out
+            }
+            $out.projectTrusted = $true
+            $list = Invoke-AppServerRequest $s 'hooks/list' ([ordered]@{ cwds = @($root) })
+            $mine = if ($list -and $list.PSObject.Properties['result'] -and $list.result) { @(Get-ProjectHookEntries $list $hooksFile) } else { @() }
+            if (-not $mine.Count) {
+                $out.result = 'project-untrusted'
+                Warn "寫了「信任 $root」，但 Codex 還是沒有載入這個專案的 hooks —— 多半是它認的專案根不是這一層（例如這裡在另一個 git repo 裡面），或組織政策只允許管理員部署的 hooks。在終端機的這個目錄開 codex，照它的提示信任。"
+                return $out
+            }
+            $pending = @($mine | Where-Object { (Get-OwnHookScript ([string]$_.command)) -and $_.trustStatus -in @('untrusted', 'modified') })
+        }
+
+        if ($pending.Count) {
+            $edits = @($pending | ForEach-Object { [ordered]@{ keyPath = "hooks.state.$(ConvertTo-ConfigKeySegment ([string]$_.key)).trusted_hash"; mergeStrategy = 'upsert'; value = [string]$_.currentHash } })
+            $w = Invoke-AppServerRequest $s 'config/batchWrite' ([ordered]@{ edits = $edits; reloadUserConfig = $true })
+            if (-not $w -or -not $w.PSObject.Properties['result'] -or -not $w.result) {
+                $out.result = 'write-failed'
+                Warn "Codex 沒有接受 hooks 信任的寫入$(if ($w -and $w.PSObject.Properties['error']) { "（$($w.error.message)）" })。在終端機開 codex，出現「Hooks need review」時選 Trust all and continue。"
+                return $out
+            }
+            $out.written = $edits.Count
+        }
+
+        # 寫成功不等於 Codex 認：再問一次，以它的回答為準。
+        $list = Invoke-AppServerRequest $s 'hooks/list' ([ordered]@{ cwds = @($root) })
+        $mine = if ($list -and $list.PSObject.Properties['result'] -and $list.result) { @(Get-ProjectHookEntries $list $hooksFile) } else { @() }
+        $ours = @($mine | Where-Object { Get-OwnHookScript ([string]$_.command) })
+        $out.hooks = @(ConvertTo-HookReport $ours)
+        $out.foreign = @(ConvertTo-HookReport @($mine | Where-Object { -not (Get-OwnHookScript ([string]$_.command)) }))
+        $bad = @($ours | Where-Object { $_.trustStatus -ne 'trusted' })
+        if (-not $ours.Count -or $bad.Count) {
+            $out.result = 'partial'
+            Warn "寫了，但再問 Codex 時這套工作流的 hooks 還有 $(if ($ours.Count) { "$($bad.Count) 條不是 trusted（$(@($bad | ForEach-Object { "$($_.eventName) $($_.trustStatus)" }) -join '、')）" } else { '一條都沒列出來' }) —— 那幾道不會跑。在終端機開 codex，出現「Hooks need review」時選 Trust all and continue；之後用 doctor -CheckHookTrust 確認。"
+            return $out
+        }
+        $out.result = 'trusted'
+        Say "Codex hooks：替你信任了 $($ours.Count) 條（$(@($ours | ForEach-Object { Get-OwnHookScript ([string]$_.command) } | Sort-Object -Unique) -join '、')）$(if ($out.projectTrusted) { '，也信任了這個資料夾' }) —— 機械強制層會跑。已經開著的 Codex 對話要開一個新的（或重新載入 VS Code 視窗）才會載入。"
+        Show-TrustLeftovers $out
+        return $out
+    } finally {
+        Stop-CodexAppServer $s
+    }
+}
+
+# 信任了也不會跑的兩種：別人的 hook（沒替它信任）、被停用的（enabled = false，多半是有人在 Codex 裡關掉的，不替他打開）。
+function Show-TrustLeftovers($out) {
+    $out.disabled = @($out.hooks | Where-Object { -not $_.enabled }).Count
+    if ($out.disabled) { Warn "這套工作流有 $($out.disabled) 條 hook 在 Codex 裡被停用了 —— 信任了也不會跑。沒有替你打開（多半是有人刻意關的）；要開就在 Codex 的 hooks 設定裡打開。" }
+    $pend = @($out.foreign | Where-Object { $_.trustStatus -ne 'trusted' })
+    if ($pend.Count) { Say "另外有 $($pend.Count) 條不是這套工作流的 hook 還沒信任 —— 沒有替你信任，要讓它們跑就在 Codex 裡審核。" }
+}
+
+function Invoke-TrustHooks {
+    $r = Invoke-HookTrustWrite $Target ([bool]$Yes)
+    foreach ($k in $r.Keys) { $script:Data[$k] = $r[$k] }
+    return $(if ($r.result -in @('trusted', 'already-trusted', 'nothing-to-trust')) { 0 } else { 2 })
+}
+
 # ---- hooks 有沒有真的在跑：心跳 vs. agent 的產出 ----
 #
 # 信任狀態只有 Codex 知道，問它要另外叫起一個 codex（最久 15 秒），所以 doctor 預設不問。但「沒在跑」看得到痕跡：
@@ -827,7 +1059,7 @@ function Show-HookTrust($trust) {
 # 不叫子行程、只讀檔的修改時間，所以 VS Code 的背景健檢也付得起。
 #
 # 只拿 agent 才會寫的檔當證據（地圖、分析、現況、審核、DB 證據、契約）：spec.md 會被人在編輯器裡改，
-# 拿它當證據，人改一次就喊一次「hooks 沒在跑」。起點是最後一次裝／升級（基準線）或 hooks.json 被換掉的時間 ——
+# 拿它當證據，人改一次就喊一次「hooks 沒在跑」。data-model.md（v4.27.0）同理不算：③ 使用者可以直接改那份表格。起點是最後一次裝／升級（基準線）或 hooks.json 被換掉的時間 ——
 # 更早的產出是舊版（還沒有心跳）寫的，不算數；而 hooks.json 一換，Codex 就要重新信任，正是要盯的那一刻。
 # 剛寫的兩分鐘內不下結論：hook 是寫完才跑，背景健檢可能搶在心跳之前讀。
 $HeartbeatGraceSec = 120
@@ -890,7 +1122,7 @@ function Show-HookHeartbeat($hb) {
         }
         'silent' {
             $last = if ($hb.lastRun) { "最後一次是 $(& $fmt $hb.lastRun)" } else { '一次都沒有' }
-            Warn "hooks 好像沒在跑：$($hb.lastOutput.path) 在 $(& $fmt $hb.lastOutput.at) 被 agent 寫過，但之後沒有任何一支 hook 跑（$last）—— 那段時間寫檔與委派沒有人擋。最常見的原因是 Codex 還沒信任 hooks（或 hooks.json 換過、待重新審核）：在專案裡開 codex，出現「Hooks need review」時選 Trust all and continue。其次是 Codex 叫不起 pwsh。要確認信任狀態：doctor -CheckHookTrust。那個檔如果是你自己手動改的，可以忽略這一條。"
+            Warn "hooks 好像沒在跑：$($hb.lastOutput.path) 在 $(& $fmt $hb.lastOutput.at) 被 agent 寫過，但之後沒有任何一支 hook 跑（$last）—— 那段時間寫檔與委派沒有人擋。最常見的原因是 Codex 還沒信任 hooks（或 hooks.json 換過、待重新審核）：跑 sdlc.ps1 trust-hooks 替你信任（或在終端機開 codex，出現「Hooks need review」時選 Trust all and continue）。其次是 Codex 叫不起 pwsh。要確認信任狀態：doctor -CheckHookTrust。那個檔如果是你自己手動改的，可以忽略這一條。"
             return 1
         }
         default { return 0 }
@@ -1943,9 +2175,15 @@ function Complete-Install([string[]]$needsMerge, [bool]$hooksWritten) {
     $script:Data.lint = $lint
 
     # hooks.json 寫出去了 = Codex 那邊一定要（重新）信任。沒信任之前強制層一條都不會跑，而 Codex 不會主動說。
+    # -TrustHooks（4.28.0）：同意已經給了，裝完直接替他信任 —— hooks.json 這次沒換也照跑一次：舊專案可能從來沒信任過
+    # （只用 VS Code chat 的人看不到審核畫面），而已經信任的話它只問一次 Codex 就回 already-trusted。
+    # 信任沒成不讓 install／update 失敗：檔都裝好了，失敗的理由與修法由它自己講，結果在 data.trust。
     $script:Data.hooksWritten = $hooksWritten
-    if ($hooksWritten) {
-        Say "hooks 寫好了，但 **Codex 要你信任之後才會跑**：在專案裡開 codex，信任這個資料夾，出現「Hooks need review」時選 Trust all and continue。沒信任之前 handoff-lint／dlp-gate／guideline-gate／build-check 一條都不會跑，而且沒有任何提示。之後隨時可以用 sdlc.ps1 doctor -CheckHookTrust 確認（doctor 預設不查這一項）。"
+    $script:Data.trust = $null
+    if ($TrustHooks -and (Test-Path -LiteralPath (Join-Path $Target $HooksRel) -PathType Leaf)) {
+        $script:Data.trust = Invoke-HookTrustWrite $Target $true
+    } elseif ($hooksWritten) {
+        Say "hooks 寫好了，但 **Codex 要你信任之後才會跑**。沒信任之前 handoff-lint／dlp-gate／guideline-gate／build-check 一條都不會跑，而且沒有任何提示。$TrustHint 之後隨時可以用 sdlc.ps1 doctor -CheckHookTrust 確認（doctor 預設不查這一項）。"
     }
 
     $cfg = Read-JsonFile (Join-Path $Target $ConfigFile)
@@ -3144,6 +3382,7 @@ $code = switch ($Command) {
     'models'       { Invoke-Models }
     'learn'        { Invoke-Learn }
     'managed-hooks' { Invoke-ManagedHooks }
+    'trust-hooks'   { Invoke-TrustHooks }
 }
 
 if ($Json) {

@@ -15,13 +15,14 @@ description: 控制既有系統的安全修改邊界與遷移模式
 
 ## Safe-Change Envelope
 
-`sa-analyst` 在系統分析時就該把邊界講清楚，寫進 `spec.md` 的選定做法：
+`sa-analyst` 在系統分析時就該把邊界講清楚，orchestrator 寫進 `spec.md` 的「改動範圍」（格式見 skill `spec-authoring`），③ 由使用者逐項核准：
 
-- **會動到的檔案與資料表** —— 具體列出，不寫「相關的服務層」
-- **不該碰的** —— 這次明確排除的區域
-- **需要額外審核的** —— 可以改，但 `reviewer` 要特別看的地方
+- **會改的既有檔案與資料表** —— 具體列出，不寫「相關的服務層」；資料表的設計在 `data-model.md`
+- **既有行為改前 → 改後、連帶影響、要改的既有測試**
+- **不動** —— 這次明確排除的區域
+- **需要額外審核的** —— 可以改，但 `reviewer` 要特別看的地方（寫進「風險」）
 
-`implementer` 發現要動的範圍比這個大很多 → **停下來回 `partial`**，不要一路改下去。
+`implementer` 要改的既有東西不在這個範圍裡 → **改之前停下來回 `partial`**，不要一路改下去；使用者同意了才補進範圍。
 
 ## 安全遷移模式
 
@@ -114,5 +115,5 @@ Phase 5：資料遷移與切換
 ## 與其他技能的關係
 
 - `impact-analysis`：提供影響面評估作為 envelope 依據
-- `data-modeling`：schema change 需要 safe-change 評估
+- `er-modeling`：schema change 的資料表設計（`data-model.md`），需要 safe-change 評估
 - `test-reliability`：確保遷移過程中測試穩定性

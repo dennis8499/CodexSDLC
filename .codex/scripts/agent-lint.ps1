@@ -273,6 +273,11 @@ $artifactContracts = @(
     # 與下一次的 sa-analyst（`analyze` 先讀它、不重查）。漏掉 orchestrator 的症狀
     # 不是報錯：survey 寫了檔卻沒人讀，起草退回只靠常識 —— 正是這個 mode 要修的那件事。
     @{ path = 'bdd-docs/{feature-id}/current-state.md'; roles = @('sa-analyst', 'bdd-orchestrator') }
+    # v4.27.0：資料表設計。生產者 sa-analyst（`analyze` 有做法會動 schema 時，completed 也寫），路由者 orchestrator
+    # （③ 把那一節貼給使用者確認、spec.md 指到它、照使用者的修改改它），消費者 implementer（照它建表）與 reviewer
+    # （拿 migration／ORM model 跟它比）。漏掉任何一方的症狀都不是報錯，是又回到 v4.26 以前：資料表由 ④ 自由發揮，
+    # 使用者要到交付才看得到 —— 正是使用者回報的那件事。
+    @{ path = 'bdd-docs/{feature-id}/data-model.md'; roles = @('sa-analyst', 'bdd-orchestrator', 'implementer', 'reviewer') }
     # v4.3.0：spec.md 多了一個消費者 —— sa-analyst 在 ② 讀 ① 的需求決議。
     # implementer／reviewer 有 handoff-lint 檢查 3a 保底（build／fix／code 必須帶 spec.md
     # 路徑），但 `analyze` **不在**那份清單裡，所以沒有任何機械層在守 SA 讀不讀得到決議。
