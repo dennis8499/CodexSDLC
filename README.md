@@ -64,6 +64,19 @@
 - API 另有外部消費者（行動 App、第三方），或前後端由不同人員分頭開發時，才先以 `sa-analyst` 的 `contract` 模式產出 API 規格。
 - 僅以替身驗證不代表前後端可正確串接；③ 選擇交付範圍時應包含整合驗證。
 
+### UI 驗收方式
+
+驗收層是 UI 時，`spec.md` 在驗收層底下多寫一行「驗收方式」，③ 一起確認：
+
+```
+驗收層：UI（瀏覽器）
+驗收方式：playwright｜chromium, mobile-safari｜1280x800、iPhone 13｜後端：替身（依 openapi.yaml）
+```
+
+- 四欄依序是工具、瀏覽器／project、尺寸或輸入方式、後端（真實或替身）。不適用寫 `—`。
+- `gherkin-check`／`delivery-check` 核對：沒寫或少欄不放行；瀏覽器層不能寫元件測試工具；Playwright 的每條 scenario 要在宣告的每個 project 通過（看 JUnit 的 testsuite hostname）；Vitest 的結果要出自 Vitest 的 JUnit。
+- 尺寸、後端兩欄與其他工具結果檔看不出來，由 reviewer 對測試碼。
+
 ## 產出
 
 | 位置 | 內容 |

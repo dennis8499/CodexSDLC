@@ -15,6 +15,7 @@ description: ③ 定案時 orchestrator 寫 bdd-docs/{feature-id}/spec.md 的格
 - **驗收條件一律寫成 Gherkin，放在 ` ```gherkin ` 區塊裡**，它之後會**原封不動**變成 `.feature` 交給 QA —— 使用者確認的字，就是 QA 拿到的字。寫法見 skill `gherkin-authoring`。
 - **Gherkin 區塊的第一行固定寫 `# feature-id: {feature-id}`**，擺在 `Feature:` 之上 —— 它跟著落進 `.feature`，②″ 靠它 grep 回原需求，`gherkin-check` 靠它找回這份 spec（少了這行它直接報錯）。
 - **Gherkin 區塊底下多寫一行「驗收層」** —— 這幾條 scenario 繫結在哪個介面上（HTTP endpoint／application service／domain method／UI）。② 選定的做法已經決定了它；不寫的話 `implementer` 自己挑，**挑錯層正是假綠燈最常見的來源**。
+- **驗收層是 UI（元件或瀏覽器）時，再寫一行「驗收方式」**，③ 跟使用者確認的就是「用什麼驗」：`驗收方式：{工具}｜{瀏覽器／project}｜{尺寸或輸入方式}｜後端：{真實／替身（依據）}`，四欄都要有，不適用寫 `—`。寫法與例子見 skill `gherkin-authoring` 的「前端 UI 驗收」。沒寫、少欄，`gherkin-check` 與 `delivery-check` 都不放行。
 - **Scenario 的具體值直接取 ① 談定的實例**（「需求決議」裡的日期、金額、狀態、門檻的邊界值）—— 這一步是謄寫，不是發明。
 
 ## 改動範圍

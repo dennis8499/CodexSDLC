@@ -71,6 +71,7 @@ mode: {mode}
 
 - 沿用既有元件、資料流、API client 與測試工具，按 `spec.md` 實作互動狀態、響應式與無障礙需求；不要自行引入框架或第二套測試工具。
 - UI 驗收依 skill `gherkin-authoring` 區分元件與瀏覽器測試，遵守 `spec.md` 指定層級。元件測試須渲染真實元件、操作公開互動並斷言畫面；跨頁流程或瀏覽器能力須在指定的瀏覽器層驗收，不能只測內部方法或 mock 掉受測互動。
+- **`spec.md` 的「驗收方式」是 ③ 核准的，照它跑**：用那個工具、在宣告的**每一個** project 跑（Playwright 的 project 名稱要跟 `playwright.config` 逐字一樣），viewport／輸入方式與後端替身照那兩欄寫進測試。回報的結果檔要是那個工具的 JUnit（Playwright 要含每個 project），`gherkin-check` 會逐條對。做不到（沒有那個 project、工具跑不起來、需要的環境沒批准）→ 回 `blocked` 講原因，不要自己改驗收方式或換工具。
 - 外部 API 在邊界用替身，格式依 `spec.md` 的文件或樣本；替身風險照既有回報規則列出。需要啟動 Web／API 或瀏覽器驗證時，仍須先由 orchestrator 取得批准。
 
 ## `.feature` 與 step definitions

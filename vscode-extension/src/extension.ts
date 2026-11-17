@@ -1,0 +1,1638 @@
+// Codex SDLC 的駕駛艙。**它是 sdlc.ps1 與各 gate 的殼，不是第二份實作。**
+//
+// 刻意不做的三件事（也寫在 README）：
+//   1. 不推測「現在在流程的第幾步」—— 流程狀態活在對話裡，靠檔案反推會猜錯。
+//   2. 不自己實作任何 lint／gate／sha 邏輯 —— 狀態一律來自 sdlc.ps1 -Json 的 data，違規一律來自 gate 的 -Json。
+//      改設定也一樣：寫檔只經過 `sdlc.ps1 set`（它先依 schema 驗完才寫），選項與說明只讀專案裡的 schema。
+//   3. 不把工作流設定存進 VS Code settings —— 那裡每機器一份、不進版控、團隊看不到。
+//      唯一真相是 sdlc.config.json；這裡的 settings 只有「pwsh 在哪」這類機器上的事。
+//
+// 4.10.0 起它也是**安裝入口**（面板永遠在，沒裝工作流時顯示安裝按鈕）。這不違反第 2 條：
+// 找發佈物 = `sdlc.ps1 fetch`（連網、下載、解壓、驗 sha 全在腳本那一側，這裡一個 socket 都不開），
+// 裝 = 發佈物自己的 `sdlc.ps1 install`，補工具檔 = 它的 `update`。vsix 內附的那一份 payload 是
+// pack.ps1 同一次建置複製進去的，所以「兩份 payload 分岔」在構造上不會發生。
+//
+// 這支檔是唯一 import vscode 的地方。能在純 Node 底下測的邏輯都在
+// pwsh／contract／status／diagnostics／config／schema／tree／codelens。
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as vscode from 'vscode';
+import { configLenses } from './codelens';
+import { ConfigReadError, countRules, readConfig, type ConfigSnapshot } from './config';
+import {
+  compareVersions, ContractError, MIN_SETTINGS_VERSION, MIN_TRUST_VERSION, MIN_WORKFLOW_VERSION, parseApply, parseCheckUpdate, parseDlpGate, parseDoctor,
+  parseEnvelope, parseFetch, parseGuidelineGate, parseInstall, parseRulesValidation, parseSet, parseTrust, parseTune, parseUpdate, parseWhatsNew,
+  TRUST_OK, type DoctorData, type Envelope, type FetchData, type SetData, type TrustData, type UpdateData,
+} from './contract';
+import { dlpOutcome, groupByFile, guidelineOutcome, RULES_REL, rulesOutcome, type DiagnosticRecord, type ScanOutcome } from './diagnostics';
+import {
+  encodedCommandArgs, fileArgs, gateInvocation, INSTALL_URL, resolvePwsh, runPwsh,
+  type PwshResolution, type RunResult,
+} from './pwsh';
+import { CONFIG_SCHEMA_REL, matchesPattern, readSettingsSchema, type Choice, type SettingsSchema } from './schema';
+import { statusFromDoctor, statusFromFailure, type StatusView } from './status';
+import {
+  buildPanel, buildSettingsTree, pendingAgentsOf, upgradeOffer,
+  type CardAction, type EditTarget, type Panel, type SettingNode, type StatusCard, type StoredProposalItem, type Tone, type TreeInput, type ViewId,
+} from './tree';
+import { renderCard } from './card';
+
+const VERSION_REL = '.codex/bdd-workflow/bdd-workflow-version.json';
+const PROFILES_REL = '.codex/bdd-workflow/tuning-profiles.json';
+const SDLC_REL = '.codex/scripts/sdlc.ps1';
+const GUIDELINE_GATE_REL = '.codex/scripts/guideline-gate.ps1';
+const DLP_GATE_REL = '.codex/scripts/dlp-gate.ps1';
+const CONFIG_REL = 'sdlc.config.json';
+const AGENTS_REL = 'AGENTS.md';
+const PROPOSAL_REL = 'bdd-docs/.sdlc/tuning-proposal.json';
+const GATE_MARKER_REL = 'guidelines/.gate-disabled';
+// 三個 view：狀態卡片（webview）＋兩棵樹。settings 是永遠在的那一個（沒裝工作流時它顯示安裝按鈕），另外兩個只在裝了之後出現。
+const STATUS_VIEW = 'codexSdlc.status';
+const SETTINGS_VIEW = 'codexSdlc.settings';
+const VIEW_IDS: Record<ViewId, string> = { settings: SETTINGS_VIEW, advanced: 'codexSdlc.advanced' };
+// 按完「套用」之後「已套用」那一行停多久（從 doctor 確認完開始算）。
+const APPLIED_FLASH_MS = 2500;
+// 樹節點的假 resourceUri —— 只為了讓 FileDecoration 把要注意的那幾行的文字也上色（ThemeIcon 只染得到圖示）。
+const DECO_SCHEME = 'codex-sdlc-node';
+const WALKTHROUGH = 'codexSdlc.start';
+// vsix 內附的那一份發佈物（pack.ps1 打包時放進來的）。沒有它也能跑，安裝那條路會退回「選擇發佈物…」。
+const PAYLOAD_DIR = 'payload';
+// 這裡**沒有**任何跟 Codex 信任狀態有關的參數，而且刻意不加：4.10.0 起 doctor 預設就不問
+// （問它要另外叫起一個 codex 子行程，而答案在這個介面裡按不動）。要查的人在終端機加 -CheckHookTrust。
+// hooks.json 在不在照樣會查 —— 那是工具檔缺了，有得修。
+// agent 寫了地圖／分析／現況／審核之後，過多久再健檢一次「hooks 有沒有在跑」。doctor 對兩分鐘內的產出不下結論
+// （hook 是寫完才跑，心跳可能還沒寫），所以要比那兩分鐘久；立刻跑的話永遠落在 pending。
+const HEARTBEAT_RECHECK_MS = 150 * 1000;
+const UPDATE_INTERVAL_MS = 60 * 60 * 1000;   // 只是「問 sdlc.ps1 到期了沒」—— 真的連網與否由 update.check 決定
+
+export interface WriteOptions { apply?: boolean; yes?: boolean; preset?: string; preview?: boolean; quiet?: boolean; root?: string }
+
+export interface CockpitApi {
+  roots(): string[];
+  status(root?: string): StatusView | undefined;
+  doctor(root?: string): DoctorData | undefined;
+  refresh(root?: string): Promise<void>;
+  scan(uri: vscode.Uri): Promise<void>;
+  diagnostics(uri: vscode.Uri): readonly vscode.Diagnostic[];
+  // 設定面板（host 測試用；面板本身也走同一條路）
+  settingsTree(root?: string): SettingNode[];
+  writeSettings(assignments: string[], opts?: WriteOptions): Promise<SetData | undefined>;
+  calls(): Record<string, number>;
+  settingsViewVisible(): boolean;
+  statusCard(root?: string): StatusCard | undefined;
+}
+
+interface RootState {
+  root: string;
+  view?: StatusView;
+  doctor?: DoctorData;
+  running?: Promise<void>;
+  again: boolean;
+  timer?: NodeJS.Timeout;
+  // agent 寫了產出之後、等 hook 的心跳落地再健檢一次（見 HEARTBEAT_RECHECK_MS）。跟 timer 分開：共用的話，
+  // 這一個兩分半的延後會把其他事件排好的立即健檢一起往後推。
+  heartbeatTimer?: NodeJS.Timeout;
+  scanPending: Set<string>;
+  scanTimer?: NodeJS.Timeout;
+  scanning?: Promise<void>;
+  // 寫了 agents.*、doctor 還沒回來確認的 agent。doctor 回來之後以它的 tuning.stale 為準。
+  pendingAgents: Set<string>;
+  lastWrite: number;
+  doctorAt?: number;
+  // 剛套用完、還在顯示「已套用」的那幾個 agent。
+  justApplied?: string[];
+}
+
+type SdlcCall =
+  | { ok: true; env: Envelope; run: RunResult }
+  | { ok: false; view: StatusView; run?: RunResult };
+
+const samePath = (a: string, b: string) =>
+  process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+
+// 正常（ok）不上色：正常不需要被慶祝。待套用與建議用品牌強調色（package.json 的 codexSdlc.accent），不用警告色 ——
+// 那是你自己的改動，不是危險。
+const ACCENT = 'codexSdlc.accent';
+const toneColor: Record<Tone, string | undefined> = {
+  ok: undefined,
+  warn: 'list.warningForeground',
+  error: 'list.errorForeground',
+  pending: ACCENT,
+  muted: 'disabledForeground',
+  accent: ACCENT,
+};
+
+function toTreeItem(n: SettingNode, media: (file: string) => vscode.Uri): vscode.TreeItem {
+  const state = n.children && n.children.length > 0
+    ? (n.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
+    : vscode.TreeItemCollapsibleState.None;
+  const item = new vscode.TreeItem(n.label, state);
+  item.id = n.id;
+  item.description = n.description;
+  item.tooltip = n.tooltip;
+  item.contextValue = n.contextValue;
+  const color = n.tone ? toneColor[n.tone] : undefined;
+  if (n.iconFile) {
+    // 異常版本兩種主題共用一張（紅色在兩邊都看得到）；其他分淺色、深色各一張。
+    item.iconPath = n.iconFile.endsWith('-error')
+      ? media(`${n.iconFile}.svg`)
+      : { light: media(`${n.iconFile}-light.svg`), dark: media(`${n.iconFile}-dark.svg`) };
+  } else if (n.icon) {
+    item.iconPath = new vscode.ThemeIcon(n.icon, color ? new vscode.ThemeColor(color) : undefined);
+  }
+  if (n.command) item.command = n.command;
+  if (n.tone && labelColor[n.tone]) {
+    item.resourceUri = vscode.Uri.from({ scheme: DECO_SCHEME, path: `/${n.id}`, query: n.tone });
+    // 有 resourceUri 又沒有 tooltip 時，VS Code 會把那個假路徑當 tooltip 顯示。
+    item.tooltip ??= n.label;
+  }
+  // 「未套用」在畫面上只是行尾一個 ●，螢幕閱讀器要聽得到字。
+  if (n.tone === 'pending') item.accessibilityInformation = { label: `${n.label} ${n.description ?? ''} 未套用` };
+  return item;
+}
+
+// 只有要人注意的才連文字一起上色；ok／muted 維持一般文字。
+const labelColor: Partial<Record<Tone, string>> = { warn: toneColor.warn, error: toneColor.error, pending: ACCENT, accent: ACCENT };
+
+const nodeDecorations: vscode.FileDecorationProvider = {
+  provideFileDecoration(uri) {
+    if (uri.scheme !== DECO_SCHEME) return undefined;
+    const tone = uri.query as Tone;
+    const color = labelColor[tone];
+    // 待套用在行尾放一個 ●（跟 Git 面板的 M 同一個位置）。
+    return color ? new vscode.FileDecoration(tone === 'pending' ? '●' : undefined, tone === 'pending' ? '未套用' : undefined, new vscode.ThemeColor(color)) : undefined;
+  },
+};
+
+function nonce(): string {
+  let s = '';
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  for (let i = 0; i < 32; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+function isEditTarget(x: unknown): x is EditTarget {
+  return typeof x === 'object' && x !== null && 'kind' in x && 'key' in x;
+}
+
+class Cockpit implements vscode.Disposable {
+  private readonly output = vscode.window.createOutputChannel('Codex SDLC');
+  private readonly item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+  private readonly guidelineDiag = vscode.languages.createDiagnosticCollection('codex-sdlc-guideline');
+  private readonly dlpDiag = vscode.languages.createDiagnosticCollection('codex-sdlc-dlp');
+  private readonly rulesDiag = vscode.languages.createDiagnosticCollection('codex-sdlc-rules');
+  private readonly treeChanged = new vscode.EventEmitter<void>();
+  private readonly lensChanged = new vscode.EventEmitter<void>();
+  private readonly states = new Map<string, RootState>();
+  private readonly disposables: vscode.Disposable[] = [];
+  private readonly callCount: Record<string, number> = {};
+  private pwshCache?: PwshResolution;
+  private pwshWarned = false;
+  private updateTimer?: NodeJS.Timeout;
+  private lastPicked?: string;
+  private settingsView?: vscode.TreeView<SettingNode>;
+  private readonly views: Partial<Record<ViewId, vscode.TreeView<SettingNode>>> = {};
+  // 三個 view 共用同一次算出來的結果（treeInput 會讀好幾個檔，不要每個 view 各讀一次）。
+  private panel?: Panel;
+  private statusView?: vscode.WebviewView;
+  // 卡片上每一顆按鈕對應的指令。webview 只送回索引 —— 它叫不動任何不在這張表裡的東西。
+  private cardActions: CardAction[] = [];
+  private cardHtml?: string;
+
+  constructor(private readonly context: vscode.ExtensionContext) {
+    this.item.command = 'codexSdlc.menu';
+    this.disposables.push(this.output, this.item, this.guidelineDiag, this.dlpDiag, this.rulesDiag, this.treeChanged, this.lensChanged);
+  }
+
+  // ---- 生命週期 ----
+
+  start(): void {
+    const reg = (id: string, fn: (...args: any[]) => unknown) => this.disposables.push(vscode.commands.registerCommand(id, fn));
+    reg('codexSdlc.menu', () => this.menu());
+    reg('codexSdlc.refresh', () => this.withRoot((r) => this.refresh(r)));
+    reg('codexSdlc.doctor', () => this.withRoot((r) => this.doctorCommand(r)));
+    reg('codexSdlc.apply', () => this.withRoot((r) => this.applyCommand(r)));
+    reg('codexSdlc.tune', () => this.withRoot((r) => this.tuneCommand(r)));
+    reg('codexSdlc.whatsnew', () => this.withRoot((r) => this.whatsNewCommand(r)));
+    reg('codexSdlc.checkUpdate', () => this.withRoot((r) => this.checkUpdateCommand(r)));
+    reg('codexSdlc.showOutput', () => this.output.show());
+    // 設定面板
+    reg('codexSdlc.openSettings', () => vscode.commands.executeCommand(`${SETTINGS_VIEW}.focus`));
+    reg('codexSdlc.openAdvanced', () => vscode.commands.executeCommand(`${VIEW_IDS.advanced}.focus`));
+    reg('codexSdlc.editSetting', (arg: unknown) => this.withRoot((r) => this.editSettingCommand(r, arg)));
+    reg('codexSdlc.applyPreset', () => this.withRoot((r) => this.applyPresetCommand(r)));
+    reg('codexSdlc.applyProposalFor', (root: string, agent: string) => this.applyProposal(root, [agent]));
+    // 調校 view 裡 tune 那一行的行內「採用」：拿到的是節點本身，root 與要採用的 agent 放在 data。
+    reg('codexSdlc.adoptProposal', (node?: SettingNode) => {
+      const [root, agents] = (node?.data ?? []) as [string?, string[]?];
+      return root && agents?.length ? this.applyProposal(root, agents) : this.withRoot((r) => this.tuneCommand(r));
+    });
+    reg('codexSdlc.toggleGate', () => this.withRoot((r) => this.toggleGateCommand(r)));
+    reg('codexSdlc.pickPwsh', () => this.pickPwsh());
+    // 安裝與修復：這三條在**還沒裝工作流**的工作區也要能叫得動。
+    reg('codexSdlc.install', () => this.installCommand());
+    reg('codexSdlc.installFrom', () => this.installCommand({ pickSource: true }));
+    reg('codexSdlc.repair', () => this.withRoot((r) => this.repairCommand(r)));
+    reg('codexSdlc.upgrade', () => this.withRoot((r) => this.upgradeCommand(r)));
+    reg('codexSdlc.mergeAgents', (root?: string) => this.mergeAgentsCommand(root));
+    reg('codexSdlc.trustHooks', () => this.withRoot((r) => this.trustHooksCommand(r)));
+    reg('codexSdlc.openFile', (file: string) => vscode.window.showTextDocument(vscode.Uri.file(file)));
+    reg('codexSdlc.openWalkthrough', () => vscode.commands.executeCommand('workbench.action.openWalkthrough', `${this.context.extension.id}#${WALKTHROUGH}`, false));
+
+    const media = (file: string) => vscode.Uri.joinPath(this.context.extensionUri, 'media', 'icons', file);
+    for (const [view, id] of Object.entries(VIEW_IDS) as [ViewId, string][]) {
+      const provider: vscode.TreeDataProvider<SettingNode> = {
+        onDidChangeTreeData: this.treeChanged.event,
+        getTreeItem: (n) => toTreeItem(n, media),
+        getChildren: (n) => (n ? n.children ?? [] : this.panel?.views[view] ?? []),
+      };
+      const tv = vscode.window.createTreeView(id, { treeDataProvider: provider, showCollapseAll: view === 'advanced' });
+      this.views[view] = tv;
+      this.disposables.push(tv);
+    }
+    this.settingsView = this.views.settings;
+    this.disposables.push(
+      vscode.window.registerWebviewViewProvider(STATUS_VIEW, {
+        resolveWebviewView: (view) => {
+          this.statusView = view;
+          this.cardHtml = undefined;
+          // 不載入任何本機資源；也不開 command: 連結 —— 按鈕一律走 postMessage ＋ 上面那張表。
+          view.webview.options = { enableScripts: true, enableCommandUris: false, localResourceRoots: [] };
+          view.webview.onDidReceiveMessage((m: unknown) => this.runCardAction(m));
+          view.onDidDispose(() => { if (this.statusView === view) this.statusView = undefined; });
+          this.renderStatusCard();
+        },
+      }),
+    );
+    this.disposables.push(
+      vscode.window.registerFileDecorationProvider(nodeDecorations),
+      vscode.languages.registerCodeLensProvider({ pattern: `**/${CONFIG_REL}` }, {
+        onDidChangeCodeLenses: this.lensChanged.event,
+        provideCodeLenses: (doc) => this.codeLenses(doc),
+      }),
+    );
+
+    this.disposables.push(
+      vscode.workspace.onDidSaveTextDocument((d) => this.queueScan(d.uri)),
+      vscode.workspace.onDidOpenTextDocument((d) => this.queueScan(d.uri)),
+      vscode.window.onDidChangeActiveTextEditor(() => this.render()),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => this.syncRoots()),
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('codexSdlc.pwshPath')) { this.pwshCache = undefined; this.pwshWarned = false; }
+        if (e.affectsConfiguration('codexSdlc')) { this.render(); this.refreshViews(); for (const s of this.states.values()) this.schedule(s, 0); }
+      }),
+    );
+
+    // 工作流的檔一變就重新健檢：改了設定、apply 寫了 toml、升級換了版本檔、check-update 寫了快取、hooks.json 被改、規範檔或開關變了。
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      '**/{sdlc.config.json,.codex/agents/*.toml,.codex/hooks.json,.codex/bdd-workflow/bdd-workflow-version.json,bdd-docs/.sdlc/update-cache.json,guidelines/*,guidelines/.gate-disabled,AGENTS.md.new}',
+    );
+    const onFile = (uri: vscode.Uri) => {
+      const p = uri.fsPath.replace(/\\/g, '/');
+      if (p.endsWith(VERSION_REL)) this.syncRoots();
+      const s = this.stateFor(uri);
+      if (!s) return;
+      // rules.json 在編輯器外被改（git checkout、腳本）→ 也要重驗，不然 Problems 會停在舊的那一份。
+      if (p.endsWith(`/${RULES_REL}`) && fs.existsSync(uri.fsPath)) void this.validateRules(s.root, uri);
+      if (p.endsWith(`/${RULES_REL}`) && !fs.existsSync(uri.fsPath)) this.rulesDiag.delete(uri);
+      this.refreshViews();
+      this.schedule(s, 800);
+    };
+    // agent 的產出（doctor 拿來跟 hook 心跳比的那幾種檔）：只排一次延後的健檢，同一段時間寫再多次也只跑一次。
+    const outputWatcher = vscode.workspace.createFileSystemWatcher('**/bdd-docs/{project-map.md,*/analysis.md,*/current-state.md,*/review.md}');
+    const onOutput = (uri: vscode.Uri) => {
+      const s = this.stateFor(uri);
+      if (!s || s.heartbeatTimer) return;
+      s.heartbeatTimer = setTimeout(() => { s.heartbeatTimer = undefined; this.schedule(s, 0); }, HEARTBEAT_RECHECK_MS);
+    };
+    // tune 的提議與 schema 只影響面板與 CodeLens，不必重跑 doctor。
+    const viewWatcher = vscode.workspace.createFileSystemWatcher('**/{bdd-docs/.sdlc/tuning-proposal.json,.codex/bdd-workflow/*.schema.json}');
+    const onViewFile = () => this.refreshViews();
+    this.disposables.push(
+      watcher, watcher.onDidChange(onFile), watcher.onDidCreate(onFile), watcher.onDidDelete(onFile),
+      outputWatcher, outputWatcher.onDidChange(onOutput), outputWatcher.onDidCreate(onOutput),
+      viewWatcher, viewWatcher.onDidChange(onViewFile), viewWatcher.onDidCreate(onViewFile), viewWatcher.onDidDelete(onViewFile),
+    );
+
+    this.syncRoots();
+    for (const doc of vscode.workspace.textDocuments) this.queueScan(doc.uri);
+
+    // 背景刷新更新快取。這是這個 extension 唯一買得到、腳本層買不到的東西：沒有任何使用者動作也會發生。
+    // 要不要真的連網由 sdlc.ps1 看 update.check 決定（never = 一條連線都沒有），這裡只負責定時問。
+    const tick = () => { for (const s of this.states.values()) void this.backgroundUpdateCheck(s.root); };
+    setTimeout(tick, 5_000);
+    this.updateTimer = setInterval(tick, UPDATE_INTERVAL_MS);
+
+    // 第一次在這台機器上啟動：打開四步引導。「裝好了卻不知道介面在哪」是這個 extension 被回報過的第一個問題。
+    const shownKey = 'codexSdlc.walkthroughShown';
+    if (this.states.size > 0 && !this.context.globalState.get<boolean>(shownKey)) {
+      void this.context.globalState.update(shownKey, true);
+      void vscode.commands.executeCommand('codexSdlc.openWalkthrough');
+    }
+  }
+
+  dispose(): void {
+    if (this.updateTimer) clearInterval(this.updateTimer);
+    for (const s of this.states.values()) { if (s.timer) clearTimeout(s.timer); if (s.scanTimer) clearTimeout(s.scanTimer); if (s.heartbeatTimer) clearTimeout(s.heartbeatTimer); }
+    for (const d of this.disposables) d.dispose();
+  }
+
+  readonly api: CockpitApi = {
+    roots: () => [...this.states.keys()],
+    status: (root) => this.pick(root)?.view,
+    doctor: (root) => this.pick(root)?.doctor,
+    refresh: async (root) => {
+      const targets = root ? [this.pick(root)].filter((x): x is RootState => !!x) : [...this.states.values()];
+      await Promise.all(targets.map((s) => this.refresh(s.root)));
+    },
+    scan: async (uri) => {
+      const s = this.stateFor(uri);
+      if (!s) return;
+      this.queueScan(uri, 0);
+      await new Promise((r) => setTimeout(r, 20));
+      while (s.scanTimer || s.scanning) {
+        if (s.scanning) await s.scanning; else await new Promise((r) => setTimeout(r, 20));
+      }
+    },
+    diagnostics: (uri) => [...(this.guidelineDiag.get(uri) ?? []), ...(this.dlpDiag.get(uri) ?? []), ...(this.rulesDiag.get(uri) ?? [])],
+    settingsTree: (root) => this.settingsTree(root),
+    writeSettings: async (assignments, opts = {}) => {
+      const s = this.pick(opts.root);
+      return s ? this.writeSettings(s.root, assignments, opts) : undefined;
+    },
+    calls: () => ({ ...this.callCount }),
+    settingsViewVisible: () => this.settingsView?.visible ?? false,
+    statusCard: (root) => { const s = this.pick(root); return s ? buildPanel(this.treeInput(s)).card : undefined; },
+  };
+
+  // ---- 工作區 ----
+
+  private syncRoots(): void {
+    const found = (vscode.workspace.workspaceFolders ?? [])
+      .map((f) => f.uri.fsPath)
+      .filter((p) => fs.existsSync(path.join(p, VERSION_REL)));
+    for (const key of [...this.states.keys()]) if (!found.some((f) => samePath(f, key))) this.states.delete(key);
+    for (const root of found) {
+      if ([...this.states.keys()].some((k) => samePath(k, root))) continue;
+      const s: RootState = { root, again: false, scanPending: new Set(), pendingAgents: new Set(), lastWrite: 0 };
+      this.states.set(root, s);
+      this.schedule(s, 0);
+    }
+    // 設定面板只在裝了工作流的工作區出現 —— 沒有的話活動列不該多一個空圖示。
+    void vscode.commands.executeCommand('setContext', 'codexSdlc.active', this.states.size > 0);
+    this.render();
+    this.refreshViews();
+  }
+
+  private stateFor(uri: vscode.Uri): RootState | undefined {
+    if (uri.scheme !== 'file') return undefined;
+    let best: RootState | undefined;
+    for (const s of this.states.values()) {
+      const rel = path.relative(s.root, uri.fsPath);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      if (!best || s.root.length > best.root.length) best = s;
+    }
+    return best;
+  }
+
+  private pick(root?: string): RootState | undefined {
+    if (root) return [...this.states.values()].find((s) => samePath(s.root, root));
+    const editor = vscode.window.activeTextEditor;
+    return (editor && this.stateFor(editor.document.uri)) ?? this.states.values().next().value;
+  }
+
+  private async withRoot(fn: (root: string) => Promise<unknown>): Promise<void> {
+    const s = this.pick();
+    if (!s) {
+      // 以前這裡只說「沒裝」就結束 —— 而使用者在這一刻要的就是「那就裝啊」。
+      void vscode.window.showInformationMessage(
+        '這個工作區沒有安裝 Codex SDLC 工作流（找不到 .codex/bdd-workflow/bdd-workflow-version.json）。',
+        '安裝到這個工作區', '選擇發佈物…',
+      ).then((c) => {
+        if (c === '安裝到這個工作區') void vscode.commands.executeCommand('codexSdlc.install');
+        if (c === '選擇發佈物…') void vscode.commands.executeCommand('codexSdlc.installFrom');
+      });
+      return;
+    }
+    await fn(s.root);
+  }
+
+  // 有開、但還沒裝工作流的資料夾 —— 安裝的候選。
+  private installableFolders(): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+      .map((f) => f.uri.fsPath)
+      .filter((p) => !fs.existsSync(path.join(p, VERSION_REL)));
+  }
+
+  // ---- 執行 ----
+
+  private pwsh(): PwshResolution {
+    if (!this.pwshCache) {
+      const setting = vscode.workspace.getConfiguration('codexSdlc').get<string>('pwshPath') ?? '';
+      this.pwshCache = resolvePwsh({ setting, env: process.env, platform: process.platform, exists: (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } } });
+    }
+    return this.pwshCache;
+  }
+
+  private pwshFailure(): StatusView | undefined {
+    const r = this.pwsh();
+    if (r.ok) return undefined;
+    if (!this.pwshWarned) {
+      this.pwshWarned = true;
+      void vscode.window.showErrorMessage(r.message, '安裝 PowerShell 7', '選擇 pwsh…').then((choice) => {
+        if (choice === '安裝 PowerShell 7') void vscode.env.openExternal(vscode.Uri.parse(INSTALL_URL));
+        if (choice === '選擇 pwsh…') void vscode.commands.executeCommand('codexSdlc.pickPwsh');
+      });
+    }
+    this.log(`✖ ${r.message}`);
+    return statusFromFailure('pwsh-missing', r.message);
+  }
+
+  private log(line: string): void {
+    this.output.appendLine(`[${new Date().toLocaleTimeString()}] ${line}`);
+  }
+
+  private workflowVersion(root: string): string | undefined {
+    try { return String(JSON.parse(fs.readFileSync(path.join(root, VERSION_REL), 'utf8'))['contract-version'] ?? '') || undefined; } catch { return undefined; }
+  }
+
+  // 只讀版本檔（現成的檔），不跑任何腳本。
+  private tooOld(root: string): StatusView | undefined {
+    const version = this.workflowVersion(root);
+    if (!version || compareVersions(version, MIN_WORKFLOW_VERSION) >= 0) return undefined;
+    return statusFromFailure('workflow-too-old', `這個專案的工作流是 ${version}，這個 extension 需要 ${MIN_WORKFLOW_VERSION} 以上（結構化的 -Json 從那一版開始）。升級工作流：把新版發佈物解壓到別處，跑 sdlc.ps1 update -Target <專案>。`);
+  }
+
+  private async runSdlc(root: string, command: string, params: string[] = [], timeoutMs = 180_000): Promise<SdlcCall> {
+    const old = this.tooOld(root);
+    if (old) return { ok: false, view: old };
+    return this.runSdlcScript(root, root, command, ['-Target', root, '-Json', ...params], timeoutMs);
+  }
+
+  // 用**發佈物自己的** sdlc.ps1 對一個目標資料夾動手（install／update／fetch）。
+  // 目標可能根本還沒有 .codex/ —— 所以腳本不能從目標身上拿，版本檢查也不適用。
+  private async runSdlcFrom(payload: string, target: string, command: string, params: string[] = [], timeoutMs = 300_000): Promise<SdlcCall> {
+    return this.runSdlcScript(payload, target, command, ['-Source', payload, '-Target', target, '-Json', ...params], timeoutMs);
+  }
+
+  private async runSdlcScript(scriptRoot: string, cwd: string, command: string, args: string[], timeoutMs: number): Promise<SdlcCall> {
+    const failure = this.pwshFailure();
+    if (failure) return { ok: false, view: failure };
+    const pw = this.pwsh() as Extract<PwshResolution, { ok: true }>;
+    const script = path.join(scriptRoot, SDLC_REL);
+    this.callCount[command] = (this.callCount[command] ?? 0) + 1;
+    const run = await runPwsh(pw.path, fileArgs(script, [command, ...args]), { cwd, timeoutMs });
+    if (run.spawnError || run.timedOut) {
+      const msg = run.timedOut ? `sdlc.ps1 ${command} 超過 ${Math.round(timeoutMs / 1000)} 秒沒有結束` : `啟動 pwsh 失敗：${run.spawnError}`;
+      this.log(`✖ ${msg}`);
+      return { ok: false, view: statusFromFailure('script-failed', msg), run };
+    }
+    try {
+      return { ok: true, env: parseEnvelope(run.stdout, command), run };
+    } catch (e) {
+      const view = this.contractFailure(scriptRoot, e, run);
+      return { ok: false, view, run };
+    }
+  }
+
+  private contractFailure(root: string, e: unknown, run: RunResult): StatusView {
+    const message = e instanceof Error ? e.message : String(e);
+    this.log(`✖ ${message}`);
+    if (run.stderr.trim()) this.log(run.stderr.trim());
+    if (e instanceof ContractError && /schema/.test(message)) {
+      const version = this.workflowVersion(root) ?? '未知';
+      if (/太舊/.test(message)) {
+        return statusFromFailure('workflow-too-old', `這個專案的工作流是 ${version}，沒有結構化的 -Json —— 這個 extension 需要 ${MIN_WORKFLOW_VERSION} 以上的工作流。升級工作流，或裝跟它同版的 extension。`);
+      }
+      return statusFromFailure('schema-mismatch', `${message}（專案的工作流是 ${version}）—— 裝跟工作流同一版發佈物附的 vsix。`);
+    }
+    return statusFromFailure('script-failed', `sdlc.ps1 的輸出讀不懂：${message}`);
+  }
+
+  // ---- 發佈物（安裝的來源）----
+
+  // vsix 內附的那一份。pack.ps1 打包時才放進去，所以開發模式（F5）下不存在 —— 不存在是合法狀態。
+  private bundledPayload(): string | undefined {
+    const dir = path.join(this.context.extensionPath, PAYLOAD_DIR);
+    return fs.existsSync(path.join(dir, VERSION_REL)) ? dir : undefined;
+  }
+
+  private payloadVersion(): string | undefined {
+    const dir = this.bundledPayload();
+    return dir ? this.workflowVersion(dir) : undefined;
+  }
+
+  // 「這次要拿哪一份發佈物來裝」由 sdlc.ps1 fetch 決定：先問 update source，沒有才用內附的。
+  // 連網、下載、解壓、驗 sha 全部在腳本那一側 —— extension 自己一個 socket 都不開。
+  private async resolvePayload(target: string, opts: { quiet?: boolean } = {}): Promise<FetchData | undefined> {
+    const bundled = this.bundledPayload();
+    // fetch 本身也要有一支 sdlc.ps1 才跑得起來：內附的優先，其次是這個工作區裡已經裝好的那一份。
+    const runner = bundled ?? (fs.existsSync(path.join(target, SDLC_REL)) ? target : undefined);
+    if (!runner) return undefined;
+    const source = (vscode.workspace.getConfiguration('codexSdlc').get<string>('releaseSource') ?? '').trim();
+    const params = ['-Bundled', bundled ?? '', '-CacheDir', this.context.globalStorageUri.fsPath, ...(source ? ['-SourceUrl', source] : [])];
+    const call = await this.runSdlcScript(runner, target, 'fetch', ['-Target', target, '-Json', ...params], 180_000);
+    const env = opts.quiet ? (call.ok ? call.env : undefined) : this.report(call, 'fetch —— 找一份發佈物');
+    if (!env) return undefined;
+    try { return parseFetch(env); } catch (e) { this.log(`✖ fetch 的輸出讀不懂：${(e as Error).message}`); return undefined; }
+  }
+
+  // ---- 狀態 ----
+
+  private schedule(s: RootState, delayMs: number): void {
+    if (s.timer) clearTimeout(s.timer);
+    s.timer = setTimeout(() => { s.timer = undefined; void this.refresh(s.root); }, delayMs);
+  }
+
+  async refresh(root: string): Promise<void> {
+    const s = this.pick(root);
+    if (!s) return;
+    if (s.running) { s.again = true; await s.running; return; }
+    s.running = (async () => {
+      do {
+        s.again = false;
+        const started = Date.now();
+        this.refreshViews();
+        const call = await this.runSdlc(s.root, 'doctor');
+        if (call.ok) {
+          try {
+            s.doctor = parseDoctor(call.env);
+            s.doctorAt = Date.now();
+            s.view = statusFromDoctor(s.doctor, new Date());
+            // 這次 doctor 是在最後一次寫檔之後才開始的 → 它的 tuning.stale 已經算進那次寫檔，本地的標記可以放掉。
+            if (started >= s.lastWrite) s.pendingAgents.clear();
+          } catch (e) {
+            s.doctor = undefined;
+            s.view = this.contractFailure(s.root, e, call.run);
+          }
+        } else {
+          s.doctor = undefined;
+          s.view = call.view;
+        }
+        this.render();
+      } while (s.again);
+    })();
+    try { await s.running; } finally { s.running = undefined; this.refreshViews(); }
+  }
+
+  private render(): void {
+    const enabled = vscode.workspace.getConfiguration('codexSdlc').get<boolean>('statusBar.enabled') ?? true;
+    const s = this.pick();
+    // 換到另一個專案的檔 → 面板要跟著換。
+    if (s?.root !== this.lastPicked) { this.lastPicked = s?.root; this.refreshViews(); }
+    if (!enabled || !s) { this.item.hide(); return; }
+    const view = s.view;
+    if (!view) {
+      this.item.text = '$(sync~spin) SDLC';
+      this.item.tooltip = '正在跑 sdlc.ps1 doctor…';
+      this.item.backgroundColor = undefined;
+    } else {
+      this.item.text = view.text;
+      const md = new vscode.MarkdownString(view.tooltip.map((l) => l.replace(/[\\`*_{}[\]()#+\-.!|]/g, '\\$&')).join('  \n'));
+      md.appendMarkdown(`  \n\n_${path.basename(s.root)} · 點一下打開選單_`);
+      this.item.tooltip = md;
+      this.item.backgroundColor = view.level === 'error' ? new vscode.ThemeColor('statusBarItem.errorBackground')
+        : view.level === 'warn' ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+    }
+    this.item.show();
+  }
+
+  private refreshViews(): void {
+    const s = this.pick();
+    this.panel = s ? buildPanel(this.treeInput(s)) : undefined;
+    // 標題列的「套用」按鈕跟著這個 context key 出現／消失。
+    void vscode.commands.executeCommand('setContext', 'codexSdlc.tuningPending', (this.panel?.pending.length ?? 0) > 0);
+    this.renderStatusCard();
+    this.treeChanged.fire();
+    this.lensChanged.fire();
+  }
+
+  // 卡片與活動列上的數字是同一份 StatusCard：卡片上列幾件，圖示上就是幾。
+  private renderStatusCard(): void {
+    const v = this.statusView;
+    if (!v) return;
+    const card = this.panel?.card;
+    const n = card?.items.length ?? 0;
+    v.badge = n > 0 ? { value: n, tooltip: `${n} 件事要處理` } : undefined;
+    if (!card) return;
+    const n0 = nonce();
+    const r = renderCard(card, { nonce: n0, cspSource: v.webview.cspSource });
+    this.cardActions = r.actions;
+    // nonce 每次都不一樣，比 HTML 之前先拿掉 —— 內容沒變就不重設（重設會整頁重載、閃一下）。
+    const key = r.html.split(n0).join('');
+    if (key === this.cardHtml) return;
+    this.cardHtml = key;
+    v.webview.html = r.html;
+  }
+
+  private runCardAction(m: unknown): void {
+    const i = typeof m === 'object' && m !== null ? (m as { a?: unknown }).a : undefined;
+    const a = typeof i === 'number' ? this.cardActions[i] : undefined;
+    if (!a || !a.command.startsWith('codexSdlc.')) return;
+    void vscode.commands.executeCommand(a.command, ...(a.arguments ?? []));
+  }
+
+  private async backgroundUpdateCheck(root: string): Promise<void> {
+    if (this.pwshFailure()) return;
+    const call = await this.runSdlc(root, 'check-update', ['-IfDue']);
+    if (!call.ok) return;
+    try {
+      const d = parseCheckUpdate(call.env);
+      this.log(`背景檢查更新：${d.status}${d.latest ? `（最新 ${d.latest}）` : ''}`);
+    } catch (e) { this.log(`✖ check-update 的輸出讀不懂：${(e as Error).message}`); }
+    // 快取檔若有變，watcher 會觸發重新健檢；這裡不跳通知 —— 更新提示不得變成一個要處理的待辦。
+  }
+
+  // ---- 設定面板 ----
+
+  private canEdit(root: string): { ok: boolean; reason?: string; schema?: SettingsSchema } {
+    const version = this.workflowVersion(root);
+    if (!version || compareVersions(version, MIN_SETTINGS_VERSION) < 0) {
+      return { ok: false, reason: `這個專案的工作流是 ${version ?? '未知版本'} —— 升到 ${MIN_SETTINGS_VERSION} 以上才能在這裡改（之前請手改 sdlc.config.json 再 apply）` };
+    }
+    let schema: SettingsSchema | undefined;
+    try { schema = readSettingsSchema(root); } catch (e) { return { ok: false, reason: `${(e as Error).message} —— 重跑 sdlc.ps1 update 補回工具檔` }; }
+    if (!schema) return { ok: false, reason: `找不到 ${CONFIG_SCHEMA_REL} —— 重跑 sdlc.ps1 update 補回工具檔` };
+    if (!this.pwsh().ok) return { ok: false, reason: '找不到 PowerShell 7 —— 見「這台機器」', schema };
+    return { ok: true, schema };
+  }
+
+  private readProposal(root: string): StoredProposalItem[] | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(root, PROPOSAL_REL), 'utf8'));
+      if (!Array.isArray(raw?.proposal)) return undefined;
+      return raw.proposal
+        .filter((p: any) => typeof p?.agent === 'string' && typeof p?.effort === 'string')
+        .map((p: any) => ({ agent: p.agent, effort: p.effort, reason: typeof p.reason === 'string' ? p.reason : '' }));
+    } catch { return undefined; }
+  }
+
+  private treeInput(s: RootState): TreeInput {
+    const edit = this.canEdit(s.root);
+    let config: ConfigSnapshot | undefined;
+    let configError: string | undefined;
+    const cfgPath = path.join(s.root, CONFIG_REL);
+    if (fs.existsSync(cfgPath)) {
+      try { config = readConfig(fs.readFileSync(cfgPath, 'utf8')); } catch (e) { configError = e instanceof ConfigReadError ? e.message : String(e); }
+    }
+    // 還沒有設定檔時，agent 名冊來自工作流自己的 agent 定義（orchestrator 排最後 —— 它只是記錄）。
+    let knownAgents: string[] = [];
+    try {
+      knownAgents = [
+        ...fs.readdirSync(path.join(s.root, '.codex/agents')).filter((f) => f.endsWith('.toml')).map((f) => f.replace(/\.toml$/, '')).sort(),
+        'orchestrator',
+      ];
+    } catch { /* 沒有 agent 目錄就不列 */ }
+    const gdir = path.join(s.root, 'guidelines');
+    const gExists = fs.existsSync(gdir);
+    let files: string[] = [];
+    try { files = gExists ? fs.readdirSync(gdir, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name).sort() : []; } catch { /* 讀不到就當沒有 */ }
+    const rulesPath = path.join(s.root, RULES_REL);
+    let ruleCount: number | undefined;
+    try { ruleCount = countRules(fs.readFileSync(rulesPath, 'utf8')); } catch { /* 沒有或讀不到 */ }
+    const pw = this.pwsh();
+    return {
+      rootName: path.basename(s.root),
+      rootPath: s.root,
+      workflowVersion: this.workflowVersion(s.root),
+      schema: edit.schema,
+      canEdit: edit.ok,
+      editBlockedReason: edit.reason,
+      config,
+      configError,
+      knownAgents,
+      doctor: s.doctor,
+      checking: !!s.running,
+      checkedAt: s.doctor ? s.doctorAt : undefined,
+      failure: !s.doctor && s.view?.level === 'error' ? s.view.tooltip[0] ?? s.view.text : undefined,
+      justApplied: s.justApplied,
+      pendingAgents: [...s.pendingAgents],
+      proposal: this.readProposal(s.root),
+      guidelines: { dir: gExists, files, rulesExists: fs.existsSync(rulesPath), ruleCount, gateDisabled: fs.existsSync(path.join(s.root, GATE_MARKER_REL)) },
+      agentsNewExists: fs.existsSync(path.join(s.root, `${AGENTS_REL}.new`)),
+      machine: {
+        pwsh: pw.ok ? { ok: true, path: pw.path } : { ok: false, message: pw.message },
+        extensionVersion: String(this.context.extension.packageJSON.version ?? ''),
+        payloadVersion: this.payloadVersion(),
+      },
+    };
+  }
+
+  private settingsTree(root?: string): SettingNode[] {
+    const s = this.pick(root);
+    return s ? buildSettingsTree(this.treeInput(s)) : [];
+  }
+
+  private codeLenses(doc: vscode.TextDocument): vscode.CodeLens[] {
+    const s = this.stateFor(doc.uri);
+    if (!s || !samePath(path.dirname(doc.uri.fsPath), s.root)) return [];
+    const specs = configLenses(doc.getText(), {
+      rootPath: s.root,
+      pendingAgents: pendingAgentsOf({ doctor: s.doctor, pendingAgents: [...s.pendingAgents] }),
+      proposal: this.readProposal(s.root),
+      canEdit: this.canEdit(s.root).ok,
+    });
+    return specs.map((l) => new vscode.CodeLens(new vscode.Range(l.line, 0, l.line, 0), { title: l.title, command: l.command, arguments: l.arguments, tooltip: l.tooltip }));
+  }
+
+  // 單選清單：現值預先選好、點到別處不會消失。
+  private pickOne<T extends vscode.QuickPickItem>(items: T[], opts: { title: string; placeholder?: string; active?: T }): Promise<T | undefined> {
+    return new Promise((resolve) => {
+      const qp = vscode.window.createQuickPick<T>();
+      qp.title = opts.title;
+      qp.placeholder = opts.placeholder;
+      qp.items = items;
+      qp.ignoreFocusOut = true;
+      qp.matchOnDescription = true;
+      if (opts.active) qp.activeItems = [opts.active];
+      let done = false;
+      qp.onDidAccept(() => { done = true; resolve(qp.selectedItems[0]); qp.hide(); });
+      qp.onDidHide(() => { if (!done) resolve(undefined); qp.dispose(); });
+      qp.show();
+    });
+  }
+
+  private async editSettingCommand(root: string, arg: unknown): Promise<void> {
+    const target = isEditTarget(arg) ? arg : isEditTarget((arg as SettingNode | undefined)?.edit) ? (arg as SettingNode).edit : undefined;
+    if (!target) { await vscode.commands.executeCommand('codexSdlc.openSettings'); return; }
+    let value: string | undefined;
+    if (target.kind === 'choice') {
+      type Item = vscode.QuickPickItem & { value: string };
+      const items = target.choices.map<Item>((c) => ({
+        label: c.label === c.value ? c.value : `${c.label}（${c.value}）`,
+        description: [c.value === target.current ? '目前' : '', c.description].filter(Boolean).join(' · '),
+        value: c.value,
+      }));
+      value = (await this.pickOne(items, { title: target.title, placeholder: target.placeholder, active: items.find((x) => x.value === target.current) }))?.value;
+    } else {
+      value = await this.askText(target);
+    }
+    if (value === undefined || value === target.current) return;
+    await this.writeSettings(root, [`${target.key}=${value}`], {});
+  }
+
+  private async askText(t: Extract<EditTarget, { kind: 'text' }>): Promise<string | undefined> {
+    if (t.suggestions.length > 0) {
+      type Item = vscode.QuickPickItem & { value?: string };
+      const items: Item[] = [
+        ...t.suggestions.map<Item>((c: Choice) => ({ label: c.value, description: [c.value === t.current ? '目前' : '', c.description].filter(Boolean).join(' · '), value: c.value })),
+        { label: '$(edit) 輸入其他值…', value: undefined },
+      ];
+      const picked = await this.pickOne(items, { title: t.title, placeholder: t.prompt, active: items.find((x) => x.value === t.current) });
+      if (!picked) return undefined;
+      if (picked.value !== undefined) return picked.value;
+    }
+    return vscode.window.showInputBox({
+      title: t.title,
+      prompt: t.prompt,
+      value: t.current,
+      ignoreFocusOut: true,
+      validateInput: (v) => {
+        if (!v && !t.allowEmpty) return '不能是空的';
+        if (!matchesPattern(t.pattern, v)) return t.patternError;
+        return undefined;
+      },
+    });
+  }
+
+  // 使用者在編輯器裡有沒存的修改時，sdlc.ps1 寫磁碟上的檔會跟它打架 —— 先問、先存。
+  private async saveConfigIfDirty(root: string): Promise<boolean> {
+    const doc = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'file' && samePath(d.uri.fsPath, path.join(root, CONFIG_REL)));
+    if (!doc?.isDirty) return true;
+    const choice = await vscode.window.showWarningMessage('sdlc.config.json 有還沒存的修改。先存檔再改？', { modal: true }, '存檔並繼續');
+    if (choice !== '存檔並繼續') return false;
+    return doc.save();
+  }
+
+  private async writeSettings(root: string, assignments: string[], opts: WriteOptions): Promise<SetData | undefined> {
+    const s = this.pick(root);
+    if (!s) return undefined;
+    const edit = this.canEdit(root);
+    if (!edit.ok) { void vscode.window.showWarningMessage(edit.reason ?? '這個專案不能在這裡改設定。'); return undefined; }
+    if (!opts.preview && !(await this.saveConfigIfDirty(root))) return undefined;
+
+    const params = [
+      ...(opts.preset ? ['-Preset', opts.preset] : []),
+      ...(opts.apply ? ['-Apply'] : []),
+      ...(opts.yes ? ['-Yes'] : []),
+      ...(opts.preview ? ['-Preview'] : []),
+      ...assignments,
+    ];
+    const env = this.report(await this.runSdlc(root, 'set', params), opts.preview ? 'set（預覽）' : 'set');
+    if (!env) return undefined;
+    let d: SetData;
+    try { d = parseSet(env); } catch (e) { void vscode.window.showErrorMessage(`set 的輸出讀不懂：${(e as Error).message}`); return undefined; }
+
+    if (d.error === 'has-comments' && !opts.yes) {
+      const choice = await vscode.window.showWarningMessage(
+        'sdlc.config.json 裡有註解。',
+        { modal: true, detail: '這個檔不支援註解，寫入會把它們移除（原檔會先備份到 bdd-docs/.sdlc/）。要留的說明請搬進 _note。' },
+        '移除註解並寫入', '開啟設定檔',
+      );
+      if (choice === '移除註解並寫入') return this.writeSettings(root, assignments, { ...opts, yes: true });
+      if (choice === '開啟設定檔') void vscode.window.showTextDocument(vscode.Uri.file(path.join(root, CONFIG_REL)));
+      return d;
+    }
+    if (d.error) {
+      const first = d.errors[0];
+      const msg = first ? `${first.key}：${first.message}` : (env.warnings[0] ?? `set 沒有寫入（${d.error}）`);
+      if (first?.suggestion && !opts.quiet) {
+        void vscode.window.showErrorMessage(`${msg}。一個值都沒寫。`, `改用 ${first.suggestion}`).then((c) => {
+          if (c) void this.writeSettings(root, [first.suggestion!], opts);
+        });
+      } else if (!opts.quiet || d.error !== 'cancelled') {
+        void vscode.window.showErrorMessage(`${msg}。一個值都沒寫。`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      }
+      return d;
+    }
+    if (opts.preview) return d;
+
+    const changed = d.changes.filter((c) => c.changed);
+    if (d.written) {
+      s.lastWrite = Date.now();
+      for (const c of changed) {
+        const m = /^agents\.([^.]+)\./.exec(c.key);
+        if (m && c.needsApply) s.pendingAgents.add(m[1]);
+      }
+    }
+    if (d.applied) s.pendingAgents.clear();
+    if (!opts.quiet && changed.length > 0) {
+      const pending = !d.applied && changed.some((c) => c.needsApply);
+      const summary = changed.map((c) => `${c.key.replace(/^agents\./, '')} → ${c.to || '（空）'}`).join('、');
+      const created = d.configCreated ? '已建立 sdlc.config.json；' : '';
+      vscode.window.setStatusBarMessage(`$(check) ${created}已寫入：${summary}${pending ? '（還沒套用）' : ''}`, 6000);
+    }
+    this.refreshViews();
+    this.schedule(s, 300);
+    return d;
+  }
+
+  private async applyPresetCommand(root: string): Promise<void> {
+    const edit = this.canEdit(root);
+    if (!edit.ok) { void vscode.window.showWarningMessage(edit.reason ?? '這個專案不能在這裡改設定。'); return; }
+    let presets: Record<string, Record<string, { effort?: string; model?: string }>> = {};
+    try { presets = JSON.parse(fs.readFileSync(path.join(root, PROFILES_REL), 'utf8')).presets ?? {}; } catch { /* 下面會說 */ }
+    const names = Object.keys(presets);
+    if (names.length === 0) { void vscode.window.showWarningMessage(`讀不到預設組合（${PROFILES_REL}）。`); return; }
+    type Item = vscode.QuickPickItem & { name: string };
+    const items = names.map<Item>((n) => ({
+      label: n,
+      description: Object.entries(presets[n]).map(([a, v]) => `${a} ${v.effort ?? 'inherit'}`).join(' · '),
+      name: n,
+    }));
+    const picked = await this.pickOne(items, { title: '換成哪一組？', placeholder: '下一步會先列出會改哪些值，確認了才寫' });
+    if (!picked) return;
+    const preview = await this.writeSettings(root, [], { preset: picked.name, preview: true, quiet: true });
+    if (!preview || preview.error) return;
+    const changed = preview.changes.filter((c) => c.changed);
+    if (changed.length === 0) { void vscode.window.showInformationMessage(`現在的設定已經是 ${picked.name} 這一組。`); return; }
+    const detail = changed.map((c) => `${c.key}：${c.from ?? '（沒設）'} → ${c.to}`).join('\n');
+    const ok = await vscode.window.showInformationMessage(`換成 ${picked.name}？會改 ${changed.length} 個值並套用。`, { modal: true, detail }, '換成這組並套用');
+    if (ok !== '換成這組並套用') return;
+    const d = await this.writeSettings(root, [], { preset: picked.name, yes: true, apply: true });
+    if (d && !d.error) void vscode.window.showInformationMessage(`已換成 ${picked.name} 並套用。`);
+  }
+
+  private async applyProposal(root: string, agents: string[]): Promise<void> {
+    const edit = this.canEdit(root);
+    if (!edit.ok) { void vscode.window.showWarningMessage(edit.reason ?? '這個專案不能在這裡改設定。'); return; }
+    if (!(await this.saveConfigIfDirty(root))) return;
+    const env = this.report(await this.runSdlc(root, 'tune', ['-ApplyProposal', '-Only', agents.join(',')]), 'tune -ApplyProposal');
+    if (!env) return;
+    if (env.exit !== 0) {
+      void vscode.window.showErrorMessage(`套用建議失敗：${env.warnings[0] ?? '見輸出面板'}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+    const s = this.pick(root);
+    if (s) { s.lastWrite = Date.now(); s.pendingAgents.clear(); }
+    void vscode.window.showInformationMessage(`已套用 tune 的建議：${agents.join('、')}。`);
+    this.refreshViews();
+    await this.refresh(root);
+  }
+
+  private async toggleGateCommand(root: string): Promise<void> {
+    const marker = path.join(root, GATE_MARKER_REL);
+    if (fs.existsSync(marker)) {
+      fs.rmSync(marker, { force: true });
+      void vscode.window.showInformationMessage('規範的機械層打開了 —— 寫檔後會再用 guidelines/rules.json 掃。');
+    } else {
+      const ok = await vscode.window.showWarningMessage(
+        '關掉規範的機械層？',
+        { modal: true, detail: '關掉之後 guidelines/rules.json 一條都不會擋，包括標成 block 的規則。這個開關是 guidelines/.gate-disabled 這個檔 —— 它會活過每一次升級，doctor 會一直提醒到你刪掉它為止。' },
+        '關閉機械層',
+      );
+      if (ok !== '關閉機械層') return;
+      fs.mkdirSync(path.dirname(marker), { recursive: true });
+      fs.writeFileSync(marker, `由 VS Code 的 Codex SDLC 設定面板於 ${new Date().toISOString()} 建立。刪掉這個檔 = 打開規範的機械層。\n`);
+    }
+    const s = this.pick(root);
+    this.refreshViews();
+    if (s) this.schedule(s, 300);
+  }
+
+  private async pickPwsh(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      title: '選擇 PowerShell 7（pwsh）',
+      canSelectMany: false,
+      openLabel: '使用這個檔',
+      filters: process.platform === 'win32' ? { 執行檔: ['exe', 'cmd'] } : undefined,
+    });
+    if (!uris?.[0]) return;
+    // 機器上的路徑，寫進使用者層級的 VS Code 設定 —— 不進專案、不進 sdlc.config.json。
+    await vscode.workspace.getConfiguration('codexSdlc').update('pwshPath', uris[0].fsPath, vscode.ConfigurationTarget.Global);
+    void vscode.window.showInformationMessage(`已設定 codexSdlc.pwshPath：${uris[0].fsPath}`);
+  }
+
+  // ---- Problems：存檔時跑 gate ----
+
+  private queueScan(uri: vscode.Uri, delayMs = 700): void {
+    if (!(vscode.workspace.getConfiguration('codexSdlc').get<boolean>('problems.enabled') ?? true)) return;
+    const s = this.stateFor(uri);
+    if (!s) return;
+    const rel = path.relative(s.root, uri.fsPath).replace(/\\/g, '/');
+    // rules.json 本身不給 gate 掃（gate 本來就排除 guidelines/），改成驗它自己。
+    if (rel === RULES_REL) { void this.validateRules(s.root, uri); return; }
+    s.scanPending.add(rel);
+    if (s.scanTimer) clearTimeout(s.scanTimer);
+    s.scanTimer = setTimeout(() => { s.scanTimer = undefined; void this.drainScans(s); }, delayMs);
+  }
+
+  private async validateRules(root: string, uri: vscode.Uri): Promise<void> {
+    if (this.tooOld(root) || this.pwshFailure()) return;
+    const gate = path.join(root, GUIDELINE_GATE_REL);
+    if (!fs.existsSync(gate)) return;
+    const pw = this.pwsh() as Extract<PwshResolution, { ok: true }>;
+    const run = await runPwsh(pw.path, fileArgs(gate, ['-Validate', '-Json', '-RulesFile', uri.fsPath]), { cwd: root, timeoutMs: 60_000 });
+    let text = '';
+    try { text = fs.readFileSync(uri.fsPath, 'utf8'); } catch { /* 讀不到就全部放第一行 */ }
+    try {
+      const outcome = rulesOutcome(parseRulesValidation(run.stdout), text);
+      this.rulesDiag.set(uri, outcome.records.map(toDiagnostic));
+    } catch (e) {
+      this.log(`✖ guideline-gate -Validate 的輸出讀不懂：${(e as Error).message}${run.stderr ? ` / ${run.stderr.trim()}` : ''}`);
+    }
+  }
+
+  private async drainScans(s: RootState): Promise<void> {
+    if (s.scanning) return;   // 正在跑的那一輪結束後會再看一次 pending
+    s.scanning = (async () => {
+      while (s.scanPending.size > 0) {
+        const batch = [...s.scanPending];
+        s.scanPending.clear();
+        await this.scanBatch(s.root, batch);
+      }
+    })();
+    try { await s.scanning; } finally { s.scanning = undefined; }
+  }
+
+  private async scanBatch(root: string, rels: string[]): Promise<void> {
+    if (this.tooOld(root) || this.pwshFailure()) return;
+    const pw = this.pwsh() as Extract<PwshResolution, { ok: true }>;
+    const gate = async (rel: string, extra: string[], parse: (out: string) => ScanOutcome, collection: vscode.DiagnosticCollection) => {
+      const script = path.join(root, rel);
+      if (!fs.existsSync(script)) return;
+      const run = await runPwsh(pw.path, encodedCommandArgs(gateInvocation(script, rels, extra)), { cwd: root, timeoutMs: 60_000 });
+      let outcome: ScanOutcome;
+      try {
+        outcome = parse(run.stdout);
+      } catch (e) {
+        this.log(`✖ ${path.basename(rel)} 的輸出讀不懂：${(e as Error).message}${run.stderr ? ` / ${run.stderr.trim()}` : ''}`);
+        return;
+      }
+      if (outcome.note) this.log(`⚠ ${outcome.note}`);
+      for (const [file, records] of groupByFile(outcome, rels)) {
+        collection.set(vscode.Uri.file(path.join(root, file)), records.map(toDiagnostic));
+      }
+    };
+    await Promise.all([
+      gate(GUIDELINE_GATE_REL, ['-MaxReport', '500'], (o) => guidelineOutcome(parseGuidelineGate(o)), this.guidelineDiag),
+      gate(DLP_GATE_REL, [], (o) => dlpOutcome(parseDlpGate(o)), this.dlpDiag),
+    ]);
+  }
+
+  // ---- 指令 ----
+
+  private async menu(): Promise<void> {
+    const s = this.pick();
+    if (!s) {
+      const items: (vscode.QuickPickItem & { id: string })[] = [
+        { label: '$(cloud-download) 安裝到這個工作區', description: '先看發佈物來源有沒有新版，沒有就用這個 extension 內附的那一份', id: 'codexSdlc.install' },
+        { label: '$(folder-opened) 選擇發佈物…', description: '自己指一份已解壓的資料夾或 .zip', id: 'codexSdlc.installFrom' },
+        { label: '$(rocket) 這是什麼', id: 'codexSdlc.openWalkthrough' },
+        { label: '$(output) 顯示輸出', id: 'codexSdlc.showOutput' },
+      ];
+      const pick = await vscode.window.showQuickPick(items, { title: 'Codex SDLC —— 這個工作區還沒安裝' });
+      if (pick) await vscode.commands.executeCommand(pick.id);
+      return;
+    }
+    const offer = upgradeOffer({ doctor: s.doctor, workflowVersion: this.workflowVersion(s.root), payloadVersion: this.payloadVersion() });
+    const items: (vscode.QuickPickItem & { id?: string })[] = [
+      ...(offer ? [{
+        label: `$(arrow-up) 升級到 ${offer.version}`,
+        description: offer.from === 'bundled' ? 'extension 內附，不用連網；先列出會動哪些檔，確認才升級' : '先列出會動哪些檔，確認才升級',
+        id: 'codexSdlc.upgrade',
+      }] : []),
+      { label: '$(settings-gear) 開啟設定面板', description: '一眼看到全部設定；改值、套用、換預設組合', id: 'codexSdlc.openSettings' },
+      { label: '$(refresh) 重新整理狀態', id: 'codexSdlc.refresh' },
+      { label: '$(checklist) doctor', description: '完整健檢，結果寫進輸出面板', id: 'codexSdlc.doctor' },
+      { label: '$(sync) apply', description: '把 sdlc.config.json 套到 agent 定義', id: 'codexSdlc.apply' },
+      { label: '$(lightbulb) tune', description: '依 repo 現況給調校建議，你勾選要套用哪幾個', id: 'codexSdlc.tune' },
+      { label: '$(book) whatsnew', description: '這一版／新版的變更說明', id: 'codexSdlc.whatsnew' },
+      { label: '$(cloud-download) 立即檢查更新', id: 'codexSdlc.checkUpdate' },
+      { label: '$(tools) 補回工具檔', description: '用發佈物重跑 update —— .codex/ 少了東西時用這個', id: 'codexSdlc.repair' },
+      { label: '$(rocket) 開始使用', description: '四步引導：安裝、選預設組合、健檢、設定在哪', id: 'codexSdlc.openWalkthrough' },
+      { label: '$(output) 顯示輸出', id: 'codexSdlc.showOutput' },
+    ];
+    const issues = s?.view?.issues ?? [];
+    const pick = await vscode.window.showQuickPick(
+      [...issues.map((i) => ({ label: `${i.level === 'error' ? '$(error)' : '$(warning)'} ${i.badge.replace(/^\$\([^)]+\)\s*/, '')}`, detail: i.detail })), ...items],
+      { title: s ? `Codex SDLC —— ${path.basename(s.root)}` : 'Codex SDLC', matchOnDetail: true },
+    );
+    if (pick && 'id' in pick && pick.id) await vscode.commands.executeCommand(pick.id);
+    else if (pick) this.output.show();
+  }
+
+  // ---- 安裝與修復 ----
+  //
+  // 這一段是「還沒裝工作流的資料夾」唯一的入口。它照樣不自己實作任何東西：
+  // 找發佈物 = sdlc.ps1 fetch，裝 = 發佈物自己的 sdlc.ps1 install，補工具檔 = 它的 update。
+
+  private async pickInstallTarget(): Promise<string | undefined> {
+    const folders = this.installableFolders();
+    if (folders.length === 0) {
+      if ((vscode.workspace.workspaceFolders ?? []).length === 0) {
+        void vscode.window.showInformationMessage('先開一個資料夾（檔案 → 開啟資料夾），才有地方可以裝。');
+        return undefined;
+      }
+      void vscode.window.showInformationMessage('這個工作區的每個資料夾都已經裝好 Codex SDLC 了。', '補回工具檔', '升級到最新版')
+        .then((c) => {
+          if (c === '補回工具檔') void vscode.commands.executeCommand('codexSdlc.repair');
+          if (c === '升級到最新版') void vscode.commands.executeCommand('codexSdlc.upgrade');
+        });
+      return undefined;
+    }
+    if (folders.length === 1) return folders[0];
+    type Item = vscode.QuickPickItem & { value: string };
+    const picked = await this.pickOne<Item>(
+      folders.map((f) => ({ label: path.basename(f), description: f, value: f })),
+      { title: '裝進哪一個資料夾？' },
+    );
+    return picked?.value;
+  }
+
+  // 一份都找不到時**不要停在這裡**：讓他當場指一份，或去填來源。
+  private noPayload(f: FetchData | undefined, retryWithPicked: () => void): void {
+    const why = !f
+      ? '這個 extension 沒有內附發佈物（開發模式下裝的？），而這個資料夾裡也沒有一份可以用的。'
+      : f.remote.reason === 'no-source'
+        ? '找不到發佈物：extension 沒有內附，也沒有設定發佈物來源。'
+        : `沒有自動下載到發佈物：${whyNoRemote(f)}`;
+    void vscode.window.showWarningMessage(why, '選擇發佈物…', '設定發佈物來源…').then((c) => {
+      if (c === '選擇發佈物…') retryWithPicked();
+      if (c === '設定發佈物來源…') void vscode.commands.executeCommand('workbench.action.openSettings', 'codexSdlc.releaseSource');
+    });
+  }
+
+  // 使用者自己指一份發佈物：資料夾（已解壓）或 .zip。兩種都交給 fetch -NoRemote 驗過才用 ——
+  // 驗證只有那一份實作，而且「我明明指定了這一份」時不該偷偷跑去連網拿別的。
+  private async pickReleaseOnDisk(target: string): Promise<FetchData | undefined> {
+    type Item = vscode.QuickPickItem & { dir: boolean };
+    const what = await this.pickOne<Item>(
+      [
+        { label: '$(folder) 已解壓的發佈物資料夾', description: '裡面有 .codex/、.agents/、AGENTS.md', dir: true },
+        { label: '$(file-zip) 發佈物的 .zip', description: 'codex-sdlc-<版本>.zip —— 會先解壓到快取再驗', dir: false },
+      ],
+      { title: '發佈物在哪裡？' },
+    );
+    if (!what) return undefined;
+    const uris = await vscode.window.showOpenDialog({
+      title: what.dir ? '選擇已解壓的發佈物資料夾' : '選擇發佈物的 .zip',
+      canSelectMany: false,
+      canSelectFiles: !what.dir,
+      canSelectFolders: what.dir,
+      openLabel: '用這一份安裝',
+      filters: what.dir ? undefined : { 發佈物: ['zip'] },
+    });
+    if (!uris?.[0]) return undefined;
+    const runner = this.bundledPayload() ?? (what.dir ? uris[0].fsPath : undefined)
+      ?? (fs.existsSync(path.join(target, SDLC_REL)) ? target : undefined);
+    if (!runner) {
+      void vscode.window.showWarningMessage('要先有一支 sdlc.ps1 才能驗這份 zip —— 改選「已解壓的發佈物資料夾」。');
+      return undefined;
+    }
+    const call = await this.runSdlcScript(runner, target, 'fetch', [
+      '-Target', target, '-Json', '-NoRemote', '-Bundled', uris[0].fsPath, '-CacheDir', this.context.globalStorageUri.fsPath,
+    ], 180_000);
+    const env = call.ok ? this.report(call, 'fetch —— 驗這份發佈物') : undefined;
+    if (env) {
+      try {
+        const f = parseFetch(env);
+        if (!f.path) { void vscode.window.showWarningMessage(`那不是一份能用的發佈物：${env.warnings[0] ?? uris[0].fsPath}`); return undefined; }
+        return f;
+      } catch (e) { this.log(`✖ fetch 的輸出讀不懂：${(e as Error).message}`); }
+    }
+    // 手上每一支 sdlc.ps1 都比 fetch 舊（4.10.0 以前沒有這個子命令）—— 他指的是資料夾的話照樣裝得起來，
+    // 只是沒有人替他比對 sha。**這件事要講**，不要靜默降級。
+    const version = what.dir ? this.workflowVersion(uris[0].fsPath) : undefined;
+    if (!version) {
+      void vscode.window.showWarningMessage(`那不是一份能用的發佈物：${uris[0].fsPath}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return undefined;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `這份發佈物是 ${version}，它的 sdlc.ps1 還沒有 fetch —— 沒辦法替你比對 manifest 的 sha256。`,
+      { modal: true, detail: '照樣可以拿它安裝，只是「這份東西沒被動過」這件事這次沒有人驗。' },
+      '照樣用這一份',
+    );
+    if (ok !== '照樣用這一份') return undefined;
+    return {
+      chosen: 'bundled', version, path: uris[0].fsPath, cacheDir: this.context.globalStorageUri.fsPath, warning: null,
+      remote: { checked: false, reachable: false, latest: null, url: null, reason: 'skipped', provider: null },
+      bundled: { version, path: uris[0].fsPath },
+    };
+  }
+
+  private async pickPreset(source: string): Promise<string | undefined> {
+    let presets: Record<string, Record<string, { effort?: string; model?: string }>> = {};
+    try { presets = JSON.parse(fs.readFileSync(path.join(source, PROFILES_REL), 'utf8')).presets ?? {}; } catch { /* 下面退回三個名字 */ }
+    type Item = vscode.QuickPickItem & { value: string };
+    const items: Item[] = [
+      { label: '全部 inherit', description: '不寫 model／effort，交給 Codex CLI 決定（預設，之後隨時可以在面板改）', value: '' },
+      ...Object.keys(presets).map<Item>((n) => ({
+        label: n,
+        description: Object.entries(presets[n]).map(([a, v]) => `${a} ${v.effort ?? 'inherit'}`).join(' · '),
+        value: n,
+      })),
+    ];
+    const picked = await this.pickOne(items, { title: '裝好之後用哪一組調校？' });
+    return picked?.value;
+  }
+
+  private async installCommand(opts: { pickSource?: boolean; target?: string } = {}): Promise<void> {
+    const target = opts.target ?? await this.pickInstallTarget();
+    if (!target) return;
+
+    const f = opts.pickSource
+      ? await this.pickReleaseOnDisk(target)
+      : await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '找一份 Codex SDLC 發佈物…' },
+        () => this.resolvePayload(target),
+      );
+    if (!opts.pickSource && !f?.path) { this.noPayload(f, () => void this.installCommand({ pickSource: true, target })); return; }
+    if (!f?.path) return;   // 使用者自己選的那條路已經說過原因了
+    const source = f.path;
+    const site = ({ github: 'GitHub', gitlab: 'GitLab', gitea: 'Gitea' } as Record<string, string>)[f.remote.provider ?? ''] ?? '遠端';
+    const how = { remote: `${site} 發佈頁的 ${f.version}`, cached: `下載過的 ${f.version}（快取）`, bundled: `本機的 ${f.version}` }[f.chosen] ?? String(f.chosen);
+
+    const hasAgents = fs.existsSync(path.join(target, AGENTS_REL));
+    const hasGuidelines = fs.existsSync(path.join(target, 'guidelines'));
+    // 發佈物的 sdlc.ps1 認得 -TrustHooks 才帶（見 MIN_TRUST_VERSION）。
+    const canTrust = !!f.version && compareVersions(f.version, MIN_TRUST_VERSION) >= 0;
+    const ok = await vscode.window.showInformationMessage(
+      `把 Codex SDLC ${f.version} 裝進 ${path.basename(target)}？`,
+      {
+        modal: true,
+        detail: [
+          `來源：${how}`,
+          '寫入 .codex/（腳本、agent 定義、hooks）、.agents/（skills）與 AGENTS.md。',
+          hasAgents
+            ? '你已經有一份 AGENTS.md —— **不會覆蓋**，新版寫成 AGENTS.md.new，裝完會開左右對照讓你合併（合併之前整套流程不會啟動）。'
+            : '會建立 AGENTS.md —— 它就是 orchestrator 本身。',
+          hasGuidelines ? 'guidelines/ 已經有了，不碰（只有你沒改過的舊版原廠 README.md 會換成新版）。' : 'guidelines/ 會放一份骨架 —— 那份是你的，升級不會覆蓋。',
+          '會建立 sdlc.config.json。不動 .git、不動你的程式碼。',
+          ...(canTrust ? ['', TRUST_DETAIL] : []),
+        ].join('\n'),
+      },
+      '安裝', '選一組調校再裝…',
+    );
+    if (!ok) return;
+    let preset: string | undefined = '';
+    if (ok === '選一組調校再裝…') {
+      preset = await this.pickPreset(source);
+      if (preset === undefined) return;
+    }
+
+    const call = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `安裝 Codex SDLC ${f.version} 到 ${path.basename(target)}…` },
+      () => this.runSdlcFrom(source, target, 'install', [...(preset ? ['-Preset', preset] : []), ...(canTrust ? ['-TrustHooks'] : [])]),
+    );
+    const env = this.report(call, 'install');
+    if (!env) return;
+    let d;
+    try { d = parseInstall(env); } catch (e) { void vscode.window.showErrorMessage(`install 的輸出讀不懂：${(e as Error).message}`); return; }
+    if (d.error) {
+      const why: Record<string, string> = {
+        'not-a-release': '選到的不是一份完整的發佈物。',
+        'same-path': '發佈物跟目標是同一個資料夾。',
+        'nothing-to-adopt': '這個資料夾沒有 .codex/ 可以接管。',
+      };
+      void vscode.window.showErrorMessage(`沒有安裝：${why[d.error] ?? d.error}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+
+    this.syncRoots();
+    await this.refresh(target);
+
+    const trustBad = !!d.trust && !TRUST_OK.includes(d.trust.result);
+    const actions = [
+      ...(d.needsMerge.includes(AGENTS_REL) ? ['比對並合併 AGENTS.md'] : []),
+      ...(trustBad ? [TRUST_RETRY] : []),
+      ...(d.lint.passed && !trustBad ? [] : ['顯示輸出']),
+      '開啟設定面板',
+    ];
+    const merge = d.needsMerge.length > 0;
+    const headline = (merge
+      ? `裝好了 ${d.version}，但 ${d.needsMerge.join('、')} 你已經有一份 —— 沒有覆蓋，新版寫成 .new。合併之前整套流程不會啟動。`
+      : `裝好了 ${d.version}（${d.written} 個檔）。在專案裡開 Codex，直接說你要什麼即可。`) + (d.trust ? ` ${trustSentence(d.trust)}` : '');
+    const chosen = merge || trustBad
+      ? await vscode.window.showWarningMessage(headline, ...actions)
+      : await vscode.window.showInformationMessage(headline, ...actions);
+    if (chosen === '比對並合併 AGENTS.md') await this.mergeAgentsCommand(target);
+    else if (chosen === TRUST_RETRY) await this.trustHooksCommand(target);
+    else if (chosen === '顯示輸出') this.output.show();
+    else if (chosen === '開啟設定面板') await vscode.commands.executeCommand('codexSdlc.openSettings');
+  }
+
+  private async repairCommand(root: string, pickSource = false): Promise<void> {
+    const f = pickSource
+      ? await this.pickReleaseOnDisk(root)
+      : await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '找一份 Codex SDLC 發佈物…' },
+        () => this.resolvePayload(root),
+      );
+    if (!f?.path) {
+      if (!pickSource) this.noPayload(f, () => void this.repairCommand(root, true));
+      return;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `用 ${f.version} 補回 ${path.basename(root)} 的工具檔？`,
+      {
+        modal: true,
+        detail: '走的是 sdlc.ps1 update：改過的工具檔會先備份再覆蓋，guidelines/ 與 sdlc.config.json 不會被動。',
+      },
+      '補回工具檔',
+    );
+    if (ok !== '補回工具檔') return;
+    const env = this.report(await this.runSdlcFrom(f.path, root, 'update', ['-Yes']), 'update —— 補回工具檔');
+    if (!env) return;
+    const d = parseUpdate(env);
+    if (d.error === 'not-managed') {
+      void vscode.window.showWarningMessage(
+        '這個資料夾還沒被 sdlc.ps1 接管過（沒有 sdlc.config.json）—— update 分不出哪些檔是你改過的。',
+        '改用安裝',
+      ).then((c) => { if (c) void this.installCommand({ target: root }); });
+      return;
+    }
+    if (d.error) {
+      void vscode.window.showErrorMessage(`沒有補成：${env.warnings[0] ?? d.error}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+    if (d.result === 'up-to-date') void vscode.window.showInformationMessage('工具檔本來就是齊的，一個檔都沒動。');
+    else void vscode.window.showInformationMessage(`工具檔補回來了（${d.from ?? '？'} → ${d.to ?? '？'}）${d.backup ? `，原檔備份在 ${d.backup}` : ''}。`);
+    this.syncRoots();
+    await this.refresh(root);
+  }
+
+  // 升級 = 找一份**比專案新**的發佈物 → update -Preview 把計畫攤開 → 同意才 update -Yes → 收尾。
+  // 跟「補回工具檔」分開：repair 拿到什麼版本就用什麼（包括同一版），升級只接受更新的那一份 ——
+  // 遠端拿不到時 fetch 會靜默退回 vsix 內附的那一份，它可能比專案舊，照套就是降級。
+  private async upgradeCommand(root: string, pickSource = false): Promise<void> {
+    const installed = this.workflowVersion(root);
+    if (!installed) { void vscode.window.showWarningMessage('讀不到這個專案的工作流版本 —— 改用「補回工具檔」。'); return; }
+    const f = pickSource
+      ? await this.pickReleaseOnDisk(root)
+      : await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: '下載新版 Codex SDLC 發佈物…' },
+        () => this.resolvePayload(root),
+      );
+    if (!f?.path || !f.version) {
+      if (!pickSource) this.noPayload(f, () => void this.upgradeCommand(root, true));
+      return;
+    }
+    if (compareVersions(f.version, installed) <= 0) {
+      this.explainNoUpgrade(root, f, installed);
+      return;
+    }
+
+    const plan = await this.runUpdate(f.path, root, ['-Preview'], '升級 —— 計畫');
+    // 升級用的是新版發佈物的 sdlc.ps1：它認得 -TrustHooks 才帶（見 MIN_TRUST_VERSION）。
+    const canTrust = compareVersions(f.version, MIN_TRUST_VERSION) >= 0;
+    if (!plan) return;
+    if (plan.result === 'up-to-date') { void vscode.window.showInformationMessage(`${f.version} 跟專案現有的工具檔一模一樣，一個檔都不用動。`); return; }
+    // 4.16.0 以前的發佈物沒有 update -Preview：它在 -Json 下走到確認那一步就自己取消（一個檔都沒動）。
+    const hasPlan = plan.result === 'preview';
+    if (plan.downgrade) { this.explainNoUpgrade(root, f, installed); return; }
+
+    const site = ({ github: 'GitHub', gitlab: 'GitLab', gitea: 'Gitea' } as Record<string, string>)[f.remote.provider ?? ''] ?? '遠端';
+    const how = { remote: `${site} 發佈頁`, cached: '下載過的那一份（快取）', bundled: '這個 extension 內附的那一份' }[f.chosen] ?? String(f.chosen);
+    const list = (xs: string[]) => xs.slice(0, 8).join('、') + (xs.length > 8 ? ` …等 ${xs.length} 個` : '');
+    const detail = [
+      `來源：${how}`,
+      ...(f.remote.latest && compareVersions(f.remote.latest, f.version) > 0 ? [`發佈頁上最新的是 ${f.remote.latest}，但這次拿不到（${f.remote.reason ?? '原因不明'}）—— 先升到 ${f.version}。`] : []),
+      ...(plan.breaking ? ['', '** 破壞性升級 ** —— 升級前先看變更說明（whatsnew），手上跑到一半的需求先跑完。'] : []),
+      ...(hasPlan ? [
+        '',
+        ...(plan.modified.length ? [`你改過的檔（先備份再覆蓋）：${list(plan.modified)}`] : []),
+        ...(plan.removed.length ? [`這一版刪掉的檔（備份後刪除）：${list(plan.removed)}`] : []),
+        ...(plan.added.length ? [`新增 ${plan.added.length} 個檔`] : []),
+        ...(plan.hooksChanged ? [canTrust ? 'hooks.json 會換 —— 升級完會替你在 Codex 重新信任（只信任這套工作流自己的那幾條）。' : 'hooks.json 會換 —— 升級後要在 Codex 裡重新信任，強制層才會跑。'] : []),
+      ] : ['', `這份發佈物（${f.version}）的 sdlc.ps1 列不出升級計畫 —— 改過的檔一樣會先備份再覆蓋，清單在升級後的輸出面板。`]),
+      '',
+      'guidelines/、bdd-docs/ 與 sdlc.config.json 裡你的設定不會被動。',
+    ].join('\n');
+    const show = plan.breaking ? vscode.window.showWarningMessage : vscode.window.showInformationMessage;
+    const ok = await show(`把 ${path.basename(root)} 從 ${installed} 升級到 ${f.version}？`, { modal: true, detail }, '升級', '先看變更說明');
+    if (ok === '先看變更說明') { this.output.show(true); return; }   // 計畫的輸出（含這一版的說明）已經寫進輸出面板
+    if (ok !== '升級') return;
+
+    const d = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `升級到 ${f.version}…` },
+      () => this.runUpdate(f.path!, root, ['-Yes', ...(canTrust ? ['-TrustHooks'] : [])], '升級'),
+    );
+    if (!d) return;
+    this.syncRoots();
+    await this.refresh(root);
+    if (d.result !== 'applied') { void vscode.window.showInformationMessage(`沒有升級（${d.result || '未知'}）—— 見輸出面板。`); return; }
+    await this.afterUpgrade(d, plan.hooksChanged, root);
+  }
+
+  // 跑發佈物自己的 update，錯誤在這裡就講完；回 undefined = 已經告訴使用者了。
+  private async runUpdate(payload: string, root: string, params: string[], title: string): Promise<UpdateData | undefined> {
+    const env = this.report(await this.runSdlcFrom(payload, root, 'update', params), `update —— ${title}`);
+    if (!env) return undefined;
+    let d: UpdateData;
+    try { d = parseUpdate(env); } catch (e) { void vscode.window.showErrorMessage(`update 的輸出讀不懂：${(e as Error).message}`); return undefined; }
+    if (d.error === 'not-managed') {
+      void vscode.window.showWarningMessage(
+        '這個資料夾還沒被 sdlc.ps1 接管過（沒有 sdlc.config.json）—— update 分不出哪些檔是你改過的。',
+        '改用安裝',
+      ).then((c) => { if (c) void this.installCommand({ target: root }); });
+      return undefined;
+    }
+    if (d.error) {
+      void vscode.window.showErrorMessage(`update 沒有完成：${env.warnings[0] ?? d.error}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return undefined;
+    }
+    return d;
+  }
+
+  // 拿到的不比專案新：講清楚**為什麼**，給做得到的下一步。最常見的是發佈頁有新版卻拿不到（沒附 zip、私有 repo 沒 token）。
+  private explainNoUpgrade(root: string, f: FetchData, installed: string): void {
+    const remoteNewer = f.remote.latest && compareVersions(f.remote.latest, installed) > 0;
+    const msg = remoteNewer
+      ? `發佈頁有 ${f.remote.latest}，但沒有自動下載到：${whyNoRemote(f)}`
+      : f.remote.checked && f.remote.reachable
+        ? `已是最新（${installed}）。`
+        : `沒有找到比 ${installed} 新的發佈物。${f.remote.reason ? whyNoRemote(f) : ''}這次只拿到 ${f.version}，不拿它覆蓋。`;
+    const actions = remoteNewer || !f.remote.reachable ? ['選擇發佈物…', '顯示輸出'] : [];
+    void (remoteNewer || !f.remote.reachable ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg, ...actions).then((c) => {
+      if (c === '選擇發佈物…') void this.upgradeCommand(root, true);
+      if (c === '顯示輸出') this.output.show();
+    });
+  }
+
+  // 升級之後還要做的事：一次講完，能按的就給按鈕。extension 是整台機器共用的，所以只「提供」換，不自己換。
+  private async afterUpgrade(d: UpdateData, hooksChanged: boolean, root: string): Promise<void> {
+    const ownVersion = String(this.context.extension.packageJSON.version ?? '');
+    const extStale = !!d.to && ownVersion !== d.to && !!d.vsix;
+    // 帶了 -TrustHooks：信任的結果就是答案（成功就不必再喊「去信任」）；沒帶（更舊的發佈物）才照舊叫他去 Codex 按。
+    const trustBad = !!d.trust && !TRUST_OK.includes(d.trust.result);
+    const lines = [
+      `升級完成：${d.from ?? '？'} → ${d.to ?? '？'}。`,
+      ...(d.backup ? [`改過的檔備份在 ${d.backup}。`] : []),
+      ...(d.trust ? [trustSentence(d.trust)] : hooksChanged ? ['hooks.json 換了 —— 在專案裡開 codex，出現「Hooks need review」時選 Trust all。'] : []),
+      ...(extStale ? [`這個 extension 還是 ${ownVersion}，這一版附的是 ${d.to}。`] : []),
+    ];
+    const actions = [...(extStale ? ['安裝新版 extension'] : []), ...(trustBad ? [TRUST_RETRY] : []), '看變更說明'];
+    const warn = extStale || trustBad || (hooksChanged && !d.trust);
+    const c = await (warn ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(lines.join(' '), ...actions);
+    if (c === '看變更說明') this.output.show(true);
+    if (c === TRUST_RETRY) await this.trustHooksCommand(root);
+    if (c === '安裝新版 extension' && d.vsix) {
+      try {
+        await vscode.commands.executeCommand('workbench.extensions.installExtension', vscode.Uri.file(d.vsix));
+      } catch (e) {
+        void vscode.window.showErrorMessage(`extension 沒裝上：${(e as Error).message} —— 手動裝：Extensions 面板 → … → Install from VSIX，選 ${d.vsix}`);
+        return;
+      }
+      const r = await vscode.window.showInformationMessage(`extension ${d.to} 裝好了，重新載入視窗後生效。`, '重新載入');
+      if (r) await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }
+  }
+
+  // 替使用者在 Codex 信任這套工作流的 hooks（sdlc.ps1 trust-hooks）。VS Code 的 Codex chat 不會出現「Hooks need review」，
+  // 沒信任的 hook 一條都不跑、也不提示 —— 這個確認框就是那個審核畫面：先講清楚會寫什麼，點頭了才帶 -Yes。
+  // 跑的是**專案自己的** sdlc.ps1，所以專案要先升到 MIN_TRUST_VERSION。
+  private async trustHooksCommand(root: string): Promise<void> {
+    const version = this.workflowVersion(root);
+    if (!version || compareVersions(version, MIN_TRUST_VERSION) < 0) {
+      const c = await vscode.window.showWarningMessage(
+        `這個專案的工作流是 ${version ?? '未知版本'}，${MIN_TRUST_VERSION} 起才能從這裡信任 hooks。先升級（升級時會一併信任）；或在終端機的專案目錄開 codex，出現「Hooks need review」時選 Trust all and continue。`,
+        '升級到最新版',
+      );
+      if (c) void vscode.commands.executeCommand('codexSdlc.upgrade');
+      return;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `在 Codex 信任 ${path.basename(root)} 的 hooks？`,
+      { modal: true, detail: TRUST_DETAIL },
+      '信任',
+    );
+    if (ok !== '信任') return;
+    const env = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: '在 Codex 信任 hooks…' },
+      async () => this.report(await this.runSdlc(root, 'trust-hooks', ['-Yes']), 'trust-hooks'),
+    );
+    if (!env) return;
+    let d: TrustData;
+    try { d = parseTrust(env); } catch (e) { void vscode.window.showErrorMessage(`trust-hooks 的輸出讀不懂：${(e as Error).message}`); return; }
+    await this.refresh(root);
+    if (TRUST_OK.includes(d.result)) { void vscode.window.showInformationMessage(trustSentence(d)); return; }
+    const c = await vscode.window.showWarningMessage(`${trustSentence(d)} ${env.warnings[0] ?? ''}`.trim(), '顯示輸出');
+    if (c) this.output.show();
+  }
+
+  private async mergeAgentsCommand(root?: string): Promise<void> {
+    const r = root ?? this.pick()?.root;
+    if (!r) return;
+    const mine = path.join(r, AGENTS_REL);
+    const fresh = `${mine}.new`;
+    if (!fs.existsSync(fresh)) { void vscode.window.showInformationMessage(`沒有 ${AGENTS_REL}.new —— 沒有要合併的東西。`); return; }
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(mine), vscode.Uri.file(fresh), 'AGENTS.md（你的） ↔ AGENTS.md.new（新版）');
+    const c = await vscode.window.showInformationMessage(
+      '把新版的流程那幾節合進左邊那一份（你的 AGENTS.md）。合完刪掉 .new —— 留著的話 doctor 會一直提醒。',
+      '合好了，刪掉 .new',
+    );
+    if (c) {
+      await vscode.workspace.fs.delete(vscode.Uri.file(fresh), { useTrash: true });
+      this.refreshViews();
+      await this.refresh(r);
+    }
+  }
+
+  private report(call: SdlcCall, title: string): Envelope | undefined {
+    if (!call.ok) {
+      void vscode.window.showErrorMessage(`${title}：${call.view.tooltip[0]}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return undefined;
+    }
+    this.log(`── ${title}（exit ${call.env.exit}）`);
+    for (const l of call.env.output) this.output.appendLine(l);
+    for (const w of call.env.warnings) this.output.appendLine(`⚠ ${w}`);
+    return call.env;
+  }
+
+  private async doctorCommand(root: string): Promise<void> {
+    const env = this.report(await this.runSdlc(root, 'doctor'), 'doctor');
+    if (!env) return;
+    const d = parseDoctor(env);
+    const s = this.pick(root);
+    if (s) { s.doctor = d; s.doctorAt = Date.now(); s.view = statusFromDoctor(d, new Date()); this.render(); this.refreshViews(); }
+    if (d.problems === 0) void vscode.window.showInformationMessage('doctor：沒有問題。');
+    else void vscode.window.showWarningMessage(`doctor：${d.problems} 個問題。`, '看詳細').then((c) => { if (c) this.output.show(); });
+  }
+
+  private async applyCommand(root: string): Promise<void> {
+    if (!(await this.saveConfigIfDirty(root))) return;
+    const env = this.report(await this.runSdlc(root, 'apply'), 'apply');
+    if (!env) return;
+    if (env.exit !== 0) {
+      void vscode.window.showErrorMessage(`apply 失敗：${env.warnings[0] ?? '見輸出面板'}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+    const d = parseApply(env);
+    // 回饋就在按下去的那個位置：「套用 N 項」那一行換成「已套用 …」，停一下再收起來。不另外跳通知。
+    const s = this.pick(root);
+    if (s) { s.justApplied = d.changed.map((f) => path.basename(f).replace(/\.toml$/i, '')); this.refreshViews(); }
+    this.log(d.changed.length > 0 ? `apply：更新了 ${d.changed.join('、')}` : 'apply：沒有變更，agent 定義已經跟設定檔一致。');
+    await this.refresh(root);
+    if (s) setTimeout(() => { s.justApplied = undefined; this.refreshViews(); }, APPLIED_FLASH_MS);
+  }
+
+  private async tuneCommand(root: string): Promise<void> {
+    const env = this.report(await this.runSdlc(root, 'tune'), 'tune');
+    if (!env) return;
+    const t = parseTune(env);
+    if (t.proposal.length === 0) { void vscode.window.showWarningMessage('tune 沒有產出建議 —— 見輸出面板。'); return; }
+    this.refreshViews();
+    const diffs = t.proposal.filter((p) => p.current !== p.proposed);
+    if (diffs.length === 0) {
+      void vscode.window.showInformationMessage('現在的設定已經跟 tune 的建議一致。', '看理由').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+    if (!this.canEdit(root).ok) {
+      void vscode.window.showInformationMessage(`tune 有 ${diffs.length} 項建議（見輸出面板）。${this.canEdit(root).reason ?? ''}`, '顯示輸出').then((c) => { if (c) this.output.show(); });
+      return;
+    }
+    type Item = vscode.QuickPickItem & { agent: string };
+    const picks = await vscode.window.showQuickPick<Item>(
+      diffs.map((p) => ({ label: `${p.agent}：${p.current} → ${p.proposed}`, detail: `理由：${p.reason}　訊號：${p.signal}`, picked: true, agent: p.agent })),
+      { title: 'tune 的建議 —— 勾選要套用的（這是提議，不會自己套用）', canPickMany: true, ignoreFocusOut: true, matchOnDetail: true },
+    );
+    if (!picks || picks.length === 0) return;
+    await this.applyProposal(root, picks.map((p) => p.agent));
+  }
+
+  private async whatsNewCommand(root: string): Promise<void> {
+    const env = this.report(await this.runSdlc(root, 'whatsnew'), 'whatsnew');
+    if (!env) return;
+    const w = parseWhatsNew(env);
+    this.output.show(true);
+    // 先跳按鈕再健檢：refresh 要跑 doctor（數秒），等它跑完按鈕才出現，人早就以為「只有說明、不能升」了。
+    if (w.source === 'cache' && w.latest) {
+      void vscode.window.showInformationMessage(`新版 ${w.latest} 的說明在輸出面板。`, `升級到 ${w.latest}`).then((c) => {
+        if (c) void this.upgradeCommand(root);
+      });
+    }
+    await this.refresh(root);
+  }
+
+  private async checkUpdateCommand(root: string): Promise<void> {
+    const env = this.report(await this.runSdlc(root, 'check-update'), 'check-update');
+    if (!env) return;
+    const d = parseCheckUpdate(env);
+    const text: Record<string, string> = {
+      newer: `有新版 ${d.latest}（你在 ${d.installed}）。`,
+      'up-to-date': `已是最新（${d.installed}）。`,
+      disabled: '設定為不檢查更新（sdlc.config.json 的 update.check = never）。',
+      unreachable: '檢查不到更新（離線或來源不可達）。不影響任何流程。',
+      'unsupported-source': '更新來源沒有設定，或寫法認不得（github.com／gitlab.com 直接寫網址；自架的寫成 gitea:https://… 或 gitlab:https://…）—— 在設定面板的「更新 → 來源」填上。',
+    };
+    const upgrade = d.status === 'newer' && d.latest ? `升級到 ${d.latest}` : undefined;
+    const choices = d.status === 'unsupported-source' ? ['開啟設定面板'] : upgrade ? [upgrade, '看變更說明'] : [];
+    void vscode.window.showInformationMessage(text[d.status] ?? `check-update：${d.status}`, ...choices).then((c) => {
+      if (c === '開啟設定面板') void vscode.commands.executeCommand('codexSdlc.openSettings');
+      else if (c && c === upgrade) void this.upgradeCommand(root);
+      else if (c === '看變更說明') void this.whatsNewCommand(root);
+    });
+    await this.refresh(root);
+  }
+}
+
+// 遠端拿不到時要講兩件事：**實際發生了什麼**（sdlc.ps1 的頭一條警告，例如「下載發佈物失敗（HTTP 401）」——
+// 只給 reason 代碼的話使用者只看得到 download-failed），以及**他能做什麼**。
+const TRUST_RETRY = '在 Codex 信任 hooks';
+const TRUST_DETAIL = [
+  'VS Code 的 Codex chat 不會出現「Hooks need review」—— 沒信任的 hook 一條都不跑，寫檔與委派沒有人擋，而且不會提示。',
+  '會由 Codex 自己把信任寫進你的 ~/.codex/config.toml，跟在終端機的 Codex 按 Trust all 是同一件事：',
+  '・這個資料夾（還沒信任的話）',
+  '・這套工作流自己的 hooks（指令指向 .codex/scripts 底下的 handoff-lint／dlp-gate／guideline-gate／build-check）',
+  '其他 hook（你自己加的、指令被改過的）一條都不碰。寫完會再問一次 Codex，確認它真的認了。',
+].join('\n');
+
+// 一句話講信任的結果。細節（哪一條、為什麼）在輸出面板 —— 那是 sdlc.ps1 的 warnings。
+export function trustSentence(t: TrustData): string {
+  switch (t.result) {
+    case 'trusted': return `hooks 已在 Codex 信任（${t.hooks.length} 條${t.projectTrusted ? '，含這個資料夾' : ''}）—— 機械強制層會跑；已開著的 Codex 對話要開一個新的才會載入。`;
+    case 'already-trusted': return 'hooks 在 Codex 早就信任了，強制層會跑。';
+    case 'nothing-to-trust': return 'hooks.json 裡沒有這套工作流的 hook，沒有要信任的。';
+    case 'cancelled': return '沒有信任 hooks（已取消）。';
+    case 'codex-not-found': return '沒有信任 hooks：找不到 codex 執行檔（PATH 上沒有，OpenAI 的 VS Code 擴充裡也沒找到）—— 在終端機開 codex 信任。';
+    case 'managed-only': return '沒有信任 hooks：組織政策只允許管理員部署的 hooks —— 請管理員部署（sdlc.ps1 managed-hooks）。';
+    default: return `hooks 沒有信任成功（${t.result}）—— 強制層還沒在跑。`;
+  }
+}
+
+export function whyNoRemote(f: FetchData): string {
+  const fact: Record<string, string> = {
+    'no-asset': `發佈頁的 ${f.remote.latest ?? '最新版'} 沒有附 codex-sdlc-${f.remote.latest ?? '<版本>'}.zip。`,
+    unreachable: '連不到發佈頁。',
+    'download-failed': '下載發佈物失敗。',
+    'unsupported-source': '更新來源的寫法認不得。',
+    'no-source': '沒有設更新來源。',
+  };
+  const next: Record<string, string> = {
+    'no-asset': '發佈時要把 pack.ps1 產出的 zip 掛在 release 的附件上。',
+    unreachable: '離線或逾時；私有 repo 要設環境變數 CODEX_SDLC_TOKEN_<主機>（設完要整個重開 VS Code）。',
+    'download-failed': '私有 repo 要設 CODEX_SDLC_TOKEN_<主機>（設完要整個重開 VS Code）；網路擋下載的話，手動下載後用「選擇發佈物…」。',
+    'unsupported-source': '自架的寫成 gitea:https://… 或 gitlab:https://…。',
+    'no-source': '在設定面板的「更新 → 來源」填上發佈頁。',
+  };
+  const r = f.remote.reason ?? '';
+  return `${f.warning ?? fact[r] ?? `下載回來的發佈物驗不過（${r || '原因不明'}）。`}${next[r] ? ` ${next[r]}` : ''}`;
+}
+
+function toDiagnostic(r: DiagnosticRecord): vscode.Diagnostic {
+  const line = Math.max(0, r.line - 1);
+  const d = new vscode.Diagnostic(
+    new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER),
+    r.message,
+    r.severity === 'error' ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning,
+  );
+  d.source = r.source;
+  d.code = r.code;
+  return d;
+}
+
+let cockpit: Cockpit | undefined;
+
+export function activate(context: vscode.ExtensionContext): CockpitApi {
+  cockpit = new Cockpit(context);
+  context.subscriptions.push(cockpit);
+  cockpit.start();
+  return cockpit.api;
+}
+
+export function deactivate(): void {
+  cockpit?.dispose();
+  cockpit = undefined;
+}

@@ -19,6 +19,13 @@
 #      全套照樣是綠的。所以結果檔要是全套測試的，不是只跑這次那幾條的。標了 @manual 的（QA 手動測）不要求有測試，有就要通過。
 #   5. 不過期：結果檔要比這次改過的檔（.feature、工作區底下每個 git repo 裡改過或新增的檔；bdd-docs/ 與建置輸出除外）新。
 #      先跑測試、後改程式的舊結果檔，數字再好看也不是現在這份程式碼的結果。
+#   6. 驗收方式（驗收層是 UI 才要）：③ 跟使用者確認「用什麼驗」，寫成驗收層底下一行
+#        驗收方式：{工具}｜{瀏覽器／project}｜{尺寸或輸入方式}｜後端：{真實／替身（依據）}
+#      沒寫、少欄、瀏覽器層寫了元件測試工具 → 違規（spec 的問題，回 ③）。給了 -TestResults 時再對結果檔：
+#      Playwright → 這次迭代的每條 scenario，在宣告的**每一個** project 都要有通過的 test case（JUnit 的 testsuite hostname
+#      就是 project 名稱，2026-11 以 @playwright/test 1.65 實測）；Vitest → 對到的 test case 要出自 Vitest 的 JUnit
+#      （根節點 name 是 vitest tests，vitest 5.1 實測）。其他工具、尺寸與後端那兩欄結果檔看不出來，交給 reviewer 對測試碼；
+#      JUnit 也看不出測試有沒有真的開頁面 —— 同上。
 #
 # spec.md 從 .feature 第一個 `# feature-id: {id}` 找回 bdd-docs/{id}/spec.md（③ 規定 Gherkin 區塊第一行就是它）。
 # 唯讀：不寫任何檔。DLP：只回步驟文字與行號（步驟文字本來就是使用者確認過、要交給 QA 的東西）。
@@ -124,15 +131,62 @@ function Get-TestRecords([string]$path) {
             $d = $defs[[string]$u.testId]
             if ($d) { $names += [string]$d.name; if ($d.TestMethod) { $names += [string]$d.TestMethod.name }; if ($d.Description) { $names += [string]$d.Description } }
             $o = switch -Regex ([string]$u.outcome) { '^Passed$' { 'passed' } '^(Failed|Error|Timeout|Aborted)$' { 'failed' } default { 'skipped' } }
-            $recs += [pscustomobject]@{ names = @($names | Where-Object { $_ }); outcome = $o }
+            $recs += [pscustomobject]@{ names = @($names | Where-Object { $_ }); outcome = $o; project = $null; root = 'trx' }
         }
         return $recs
     }
+    $root = [string]$x.DocumentElement.GetAttribute('name')
     foreach ($t in @($x.SelectNodes('//testcase'))) {
         $o = if ($t.SelectSingleNode('failure|error')) { 'failed' } elseif ($t.SelectSingleNode('skipped')) { 'skipped' } else { 'passed' }
-        $recs += [pscustomobject]@{ names = @([string]$t.GetAttribute('name')); outcome = $o }
+        # project：Playwright 的 testsuite hostname 是 project 名稱（其他 runner 是機器名稱）；root：Vitest 的是 vitest tests
+        $suite = $t.ParentNode
+        $proj = if ($suite -and $suite.LocalName -eq 'testsuite') { [string]$suite.GetAttribute('hostname') } else { '' }
+        $recs += [pscustomobject]@{ names = @([string]$t.GetAttribute('name')); outcome = $o; project = $proj; root = $root }
     }
     return $recs
+}
+
+# 驗收層／驗收方式那一行：先找這次迭代那一段，沒有再往前找（第 2 次迭代沒重寫就沿用前面的）
+function Get-IterText([string]$text, [int]$n) {
+    $text = $text -replace "`r`n", "`n"
+    $heads = @([regex]::Matches($text, '(?m)^##\s*迭代\s*(\d+)'))
+    $h = @($heads | Where-Object { [int]$_.Groups[1].Value -eq $n }) | Select-Object -First 1
+    $start = 0; $end = $text.Length
+    if ($h) {
+        $start = $h.Index
+        $next = @($heads | Where-Object { $_.Index -gt $h.Index }) | Select-Object -First 1
+        if ($next) { $end = $next.Index }
+    } elseif ($heads.Count) { $end = $heads[0].Index }   # 第 1 次：第一個「## 迭代」之前那段
+    return @{ region = $text.Substring($start, $end - $start); upto = $text.Substring(0, $end) }
+}
+
+function Get-SpecField($iterText, [string]$label) {
+    $re = "(?m)^[ \t]*(?:[-*][ \t]+)?\**$label\**[ \t]*[：:][ \t]*(.+?)[ \t]*$"
+    foreach ($t in $iterText.region, $iterText.upto) {
+        $m = @([regex]::Matches($t, $re))
+        if ($m.Count) { return ($m[-1].Groups[1].Value -replace '^\*+|\*+$', '').Trim() }
+    }
+    return $null
+}
+
+$UiLayerRe  = '(?i)(^|[^a-z])UI([^a-z]|$)|元件|瀏覽器|browser|component|e2e'
+$MethodHint = '驗收方式：{工具}｜{瀏覽器／project}｜{尺寸或輸入方式}｜後端：{真實／替身（依據）}'
+
+# 「驗收方式」那一行 → { layer; browser; tool; kind（playwright／vitest／jest／other）; projects; problems }
+function Read-UiMethod([string]$layer, [string]$method) {
+    $o = [ordered]@{ layer = $layer; browser = [bool]($layer -match '(?i)瀏覽器|browser|e2e'); raw = $method; tool = $null; kind = $null; projects = @(); problems = @() }
+    if (-not $method) { $o.problems += "驗收層是 UI，卻沒有「驗收方式」那一行 —— ③ 要跟使用者確認用什麼驗：$MethodHint"; return [pscustomobject]$o }
+    $f = @($method -split '\s*[｜|]\s*')
+    if ($f.Count -lt 4 -or @($f[0..3] | Where-Object { -not $_.Trim() }).Count) {
+        $o.problems += "「驗收方式」要有四欄、用 ｜ 分隔（不適用的寫 —）：$MethodHint"; return [pscustomobject]$o
+    }
+    $o.tool = $f[0].Trim()
+    $o.kind = switch -Regex ($o.tool) { '(?i)playwright' { 'playwright'; break } '(?i)vitest|quickpickle' { 'vitest'; break } '(?i)jest' { 'jest'; break } default { 'other' } }
+    $o.projects = @($f[1] -split '\s*[,，、]\s*' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^[—–-]+$' })
+    if ($o.browser -and $o.kind -in 'vitest', 'jest') { $o.problems += "驗收層是瀏覽器，「驗收方式」卻寫了元件測試工具（$($o.tool)）—— 元件測試不能取代瀏覽器層；要改層就回 ③ 跟使用者確認" }
+    if ($o.kind -eq 'playwright' -and -not $o.projects.Count) { $o.problems += '「驗收方式」寫了 Playwright，第二欄卻沒寫跑哪幾個 project（playwright.config 的 projects[].name）' }
+    if (($f[3..($f.Count - 1)] -join ' ') -notmatch '(?i)真實|真的|替身|mock|stub|fake|real') { $o.problems += '「驗收方式」第四欄要寫後端接真實的還是替身（替身寫依據，例：後端：替身（依 openapi.yaml））' }
+    return [pscustomobject]$o
 }
 
 function NormId([string]$s) { return ($s -replace '[^\p{L}\p{N}]', '').ToLowerInvariant() }
@@ -191,7 +245,7 @@ function Get-NewerSources($repos, [string]$featureFull, [string[]]$resultFulls, 
 $results = @()
 $exitCode = 0
 foreach ($f in $Feature) {
-    $r = [ordered]@{ feature = ($f -replace '\\', '/'); spec = $null; feature_id = $null; iteration = $null; passed = $true; missing_steps = @(); missing_scenarios = @(); removed_scenarios = @(); removed_steps = @(); skipped_scenarios = @(); manual_scenarios = @(); skipped_tests = $null; scenarios_without_test = $null; scenarios_not_passed = $null; prior_scenarios_without_test = $null; prior_scenarios_not_passed = $null; stale_results_newer = $null; error = $null }
+    $r = [ordered]@{ feature = ($f -replace '\\', '/'); spec = $null; feature_id = $null; iteration = $null; passed = $true; missing_steps = @(); missing_scenarios = @(); removed_scenarios = @(); removed_steps = @(); skipped_scenarios = @(); manual_scenarios = @(); skipped_tests = $null; scenarios_without_test = $null; scenarios_not_passed = $null; prior_scenarios_without_test = $null; prior_scenarios_not_passed = $null; stale_results_newer = $null; ui_method = $null; ui_method_problems = @(); ui_projects_missing = $null; ui_method_mismatch = $null; error = $null }
     try {
         if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "找不到 $f" }
         $featText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $f).Path)
@@ -201,7 +255,8 @@ foreach ($f in $Feature) {
         if (-not $specPath) { throw '.feature 沒有 `# feature-id:` 那一行，也沒有給 -Spec —— ③ 規定 Gherkin 區塊第一行固定寫它' }
         if (-not (Test-Path -LiteralPath $specPath -PathType Leaf)) { throw "找不到 $specPath" }
         $r.spec = ($specPath -replace '\\', '/')
-        $blocks = Get-SpecBlocks ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $specPath).Path))
+        $specText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $specPath).Path)
+        $blocks = Get-SpecBlocks $specText
         if (-not $blocks.Count) { throw "$specPath 裡沒有 ``````gherkin 區塊" }
         $iter = if ($Iteration -gt 0) { $Iteration } else { [int](($blocks.Keys | Measure-Object -Maximum).Maximum) }
         if (-not $blocks.ContainsKey($iter)) { throw "$specPath 沒有第 $iter 次迭代的 Gherkin 區塊" }
@@ -210,6 +265,17 @@ foreach ($f in $Feature) {
         $want = Read-Gherkin $blocks[$iter]
         $have = Read-Gherkin $featText
         $r.manual_scenarios = @($have.manual)   # delivery-check 拿它核對「待人工驗證」有沒有寫進交付
+
+        # 6. 驗收方式（spec 這一半；結果檔那一半在第 4 項裡一起對）
+        $iterText = Get-IterText $specText $iter
+        $layer = Get-SpecField $iterText '驗收層'
+        $ui = $null
+        if ($layer -and $layer -match $UiLayerRe) {
+            $ui = Read-UiMethod $layer (Get-SpecField $iterText '驗收方式')
+            $r.ui_method = $ui
+            $r.ui_method_problems = @($ui.problems)
+        }
+        $checkUi = $ui -and -not $ui.problems.Count -and $ui.kind -in 'playwright', 'vitest'
 
         # 1. 逐字
         foreach ($title in $want.scenarios.Keys) {
@@ -264,12 +330,13 @@ foreach ($f in $Feature) {
 
             # 4. 逐條通過。以標題開頭的對應會讓「取消訂單」也吃到「取消訂單失敗」的測試 —— 也對得上更長標題的那個 test 不算。
             $featKey = NormId ([regex]::Match($featText, '(?m)^\s*(?:Feature|功能)\s*:\s*(.+?)\s*$').Groups[1].Value)
-            $recs = @($TestResults | ForEach-Object { Get-TestRecords $_ } | ForEach-Object { [pscustomobject]@{ keys = (Get-NameKeys $_ $featKey); outcome = $_.outcome } })
+            $recs = @($TestResults | ForEach-Object { Get-TestRecords $_ } | ForEach-Object { [pscustomobject]@{ keys = (Get-NameKeys $_ $featKey); outcome = $_.outcome; project = $_.project; root = $_.root } })
             # 「較長的標題」要看整份 .feature：這次的「取消訂單」不能吃前幾次「取消訂單並退款」的測試。
             $titles = @(@($want.scenarios.Keys) + @($have.scenarios.Keys) | Select-Object -Unique |
                         ForEach-Object { [pscustomobject]@{ title = $_; key = (NormId $_); prior = (-not $want.scenarios.Contains($_)) } })
             $r.scenarios_without_test = @(); $r.scenarios_not_passed = @()
             $r.prior_scenarios_without_test = @(); $r.prior_scenarios_not_passed = @()
+            if ($checkUi) { $r.ui_projects_missing = @(); $r.ui_method_mismatch = @() }
             foreach ($t in $titles) {
                 $longer = @($titles | Where-Object { $_.key.Length -gt $t.key.Length -and $_.key.StartsWith($t.key) } | ForEach-Object { $_.key })
                 $hit = @($recs | Where-Object {
@@ -283,7 +350,18 @@ foreach ($f in $Feature) {
                     elseif ($t.title -notin $have.skipped) { $r.prior_scenarios_without_test += $t.title }
                     continue
                 }
+                # 6. 驗收方式：這次迭代的 scenario 要用宣告的工具、在宣告的每一個 project 通過
+                if ($checkUi -and -not $t.prior) {
+                    if ($ui.kind -eq 'playwright') {
+                        $ok = @($hit | Where-Object { $_.outcome -eq 'passed' })
+                        $miss = @($ui.projects | Where-Object { $p = $_; -not @($ok | Where-Object { $_.project -ceq $p }).Count })
+                        if ($miss.Count) { $r.ui_projects_missing += [pscustomobject]@{ scenario = $t.title; detail = ($miss -join '、') } }
+                    } elseif (-not @($hit | Where-Object { $_.root -match '(?i)vitest' }).Count) {
+                        $r.ui_method_mismatch += [pscustomobject]@{ scenario = $t.title; detail = $ui.tool }
+                    }
+                }
                 $bad = @($hit | Where-Object { $_.outcome -ne 'passed' } | ForEach-Object { $_.outcome })
+
                 if ($bad.Count) {
                     $entry = [pscustomobject]@{ scenario = $t.title; outcomes = $bad }
                     if ($t.prior) { $r.prior_scenarios_not_passed += $entry } else { $r.scenarios_not_passed += $entry }
@@ -299,7 +377,8 @@ foreach ($f in $Feature) {
                           $r.skipped_scenarios.Count -or ($r.skipped_tests -gt 0) -or
                           @($r.scenarios_without_test | Where-Object { $_ }).Count -or @($r.scenarios_not_passed | Where-Object { $_ }).Count -or
                           @($r.prior_scenarios_without_test | Where-Object { $_ }).Count -or @($r.prior_scenarios_not_passed | Where-Object { $_ }).Count -or
-                          @($r.stale_results_newer | Where-Object { $_ }).Count)   # 沒給 -TestResults 時是 $null，而 @($null).Count 是 1
+                          @($r.stale_results_newer | Where-Object { $_ }).Count -or @($r.ui_method_problems | Where-Object { $_ }).Count -or
+                          @($r.ui_projects_missing | Where-Object { $_ }).Count -or @($r.ui_method_mismatch | Where-Object { $_ }).Count)   # 沒給 -TestResults 時是 $null，而 @($null).Count 是 1
         if (-not $r.passed -and $exitCode -eq 0) { $exitCode = 2 }
     } catch {
         $r.passed = $false; $r.error = $_.Exception.Message; $exitCode = 1
@@ -314,6 +393,11 @@ if ($Json) {
         if ($r.error) { [Console]::Error.WriteLine("[gherkin-check] $($r.feature)：$($r.error)"); continue }
         if ($r.passed) {
             $extra = if ($null -ne $r.scenarios_without_test) { '、每條 scenario（含前幾次迭代的）都有通過的測試、結果檔不過期' } else { '' }
+            if ($null -ne $r.ui_projects_missing) {
+                $extra += if ($r.ui_method.kind -eq 'playwright') { "、在宣告的每個 project（$($r.ui_method.projects -join '、')）都通過" } else { "、是 $($r.ui_method.tool) 跑出來的" }
+            } elseif ($r.ui_method -and $r.ui_method.kind -notin 'playwright', 'vitest') {
+                $extra += "（驗收方式 $($r.ui_method.tool) 從結果檔看不出工具，交給 reviewer 對）"
+            }
             "[gherkin-check] OK — $($r.feature) 對 $($r.spec)（迭代 $($r.iteration)）逐字一致、既有的沒動、沒有略過$extra。"; continue
         }
         [Console]::Error.WriteLine("[gherkin-check] $($r.feature) 對 $($r.spec)（迭代 $($r.iteration)）：")
@@ -327,6 +411,9 @@ if ($Json) {
         foreach ($s in @($r.scenarios_not_passed))   { if ($s) { [Console]::Error.WriteLine("  - 這條 scenario 的測試沒有全部通過（$($s.outcomes -join '、')）：$($s.scenario)") } }
         foreach ($s in @($r.prior_scenarios_without_test)) { if ($s) { [Console]::Error.WriteLine("  - 前幾次迭代的 scenario 在結果檔裡找不到測試：$s —— 這次的改動讓它的 step 失去繫結，或給的結果檔只跑了部分測試（要給全套的）；QA 手動測的請標 @manual") } }
         foreach ($s in @($r.prior_scenarios_not_passed))   { if ($s) { [Console]::Error.WriteLine("  - 前幾次迭代的 scenario 測試沒有全部通過（$($s.outcomes -join '、')）：$($s.scenario) —— 這次的改動弄壞了已經交付的行為") } }
+        foreach ($s in @($r.ui_method_problems)) { if ($s) { [Console]::Error.WriteLine("  - $s") } }
+        foreach ($s in @($r.ui_projects_missing)) { if ($s) { [Console]::Error.WriteLine("  - 這條 scenario 沒有在「驗收方式」宣告的 project 通過：$($s.scenario)（缺 $($s.detail)）—— 要給 Playwright 的 JUnit（testsuite hostname 就是 project 名稱），而且每個宣告的 project 都要跑") } }
+        foreach ($s in @($r.ui_method_mismatch))  { if ($s) { [Console]::Error.WriteLine("  - 這條 scenario 的測試不是「驗收方式」宣告的工具（$($s.detail)）跑出來的：$($s.scenario) —— 給那個工具的 JUnit，或回 ③ 改驗收方式") } }
         if (@($r.stale_results_newer | Where-Object { $_ }).Count) { [Console]::Error.WriteLine("  - 結果檔比這些改過的檔舊，不是現在這份程式碼的結果，重跑測試再檢查：$((@($r.stale_results_newer) | Select-Object -First 5) -join '、')") }
     }
 }

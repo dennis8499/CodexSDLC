@@ -413,3 +413,34 @@ Describe-Suite 'delivery-check / 寫檔時那兩道 gate 交付前再跑一次�
         } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
+
+Describe-Suite 'delivery-check / UI 驗收方式（gherkin-check 第 6 項帶上來）' {
+
+    It-Should '驗收層 UI 沒寫驗收方式 → gherkin 問題裡指名「驗收方式」、修法指回 ③；補上且每個 project 都過 → 綠' {
+        $ui = $DcSpecBody -replace '驗收層：application service', '驗收層：UI（瀏覽器）'
+        $pw = "`n驗收方式：playwright｜chromium｜1280x800｜後端：替身（依 openapi.yaml）`n"
+        $junit = '<testsuites id="" name=""><testsuite name="cancel.feature.spec.js" hostname="chromium" tests="2" skipped="0">' +
+                 '<testcase name="取消訂單 › 未出貨的訂單可以取消" /><testcase name="取消訂單 › 已出貨的訂單不能取消" /></testsuite></testsuites>'
+        try {
+            New-DcProject -spec ($ui + $DcDelivery)
+            $r = Invoke-Dc
+            Assert-Equal 2 $r.exit "沒寫驗收方式卻交付得出去：$($r.stdout)"
+            $g = @($r.json.problems | Where-Object code -eq 'gherkin')[0]
+            Assert-Match '驗收方式：驗收層是 UI' (@($g.items) -join '|')
+            Assert-Match '回 ③' $g.fix
+
+            New-DcProject -spec ($ui + $pw + $DcDelivery)
+            Write-DcFile 'TestResults/junit.xml' $junit
+            (Get-Item (Join-Path $DcRoot 'TestResults/junit.xml')).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(1)
+            $r = Invoke-Dc @{ TestResults = 'TestResults/junit.xml' }
+            Assert-Equal 0 $r.exit "stdout: $($r.stdout) stderr: $($r.stderr)"
+
+            Write-DcFile 'TestResults/junit.xml' ($junit -replace 'hostname="chromium"', 'hostname="firefox"')
+            (Get-Item (Join-Path $DcRoot 'TestResults/junit.xml')).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(1)
+            $r = Invoke-Dc @{ TestResults = 'TestResults/junit.xml' }
+            Assert-Equal 2 $r.exit "沒在 chromium 跑卻交付得出去：$($r.stdout)"
+            $g = @($r.json.problems | Where-Object code -eq 'gherkin')[0]
+            Assert-Match '沒有在驗收方式宣告的 project 通過：未出貨的訂單可以取消（chromium）' (@($g.items) -join '|')
+        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}

@@ -502,3 +502,149 @@ Describe-Suite 'gherkin-check / 前後端分成兩個 repo、工作流裝在外�
         } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
+
+Describe-Suite 'gherkin-check / 驗收方式：UI 用什麼驗，③ 定下來、結果檔對得上' {
+    # JUnit 照真實輸出的形狀：Playwright 的 testsuite hostname 是 project 名稱、testcase name 是「Feature › Scenario」；
+    # Vitest 的根節點 name 是 vitest tests、hostname 是機器名稱（2026-11 以 @playwright/test 1.65、vitest 5.1 實測）。
+    $Titles = @('未出貨的訂單可以取消', '已出貨的訂單不能取消')
+    function Get-UiSpec([string]$layer, [string]$method) {
+        $s = $GcSpec -replace '驗收層：application service', "驗收層：$layer"
+        if ($method) { $s += "`n$method`n" }
+        return $s
+    }
+    function New-PwJunit([hashtable]$projects) {   # project = @(失敗的標題)
+        $suites = ''
+        foreach ($p in $projects.Keys) {
+            $cases = ''
+            foreach ($t in $Titles) {
+                $body = if ($t -in @($projects[$p])) { '<failure message="boom"/>' } else { '' }
+                $cases += "<testcase name=""取消訂單 › $t"" classname=""features\cancel.feature.spec.js"">$body</testcase>"
+            }
+            $suites += "<testsuite name=""features\cancel.feature.spec.js"" hostname=""$p"" tests=""2"" failures=""$(@($projects[$p]).Count)"" skipped=""0"">$cases</testsuite>"
+        }
+        return "<testsuites id="""" name="""" tests=""4"">$suites</testsuites>"
+    }
+    function New-VtJunit {
+        $cases = ($Titles | ForEach-Object { "<testcase classname=""tests/Features/CancelOrder.feature"" name=""Feature: 取消訂單 &gt; Scenario: $_""></testcase>" }) -join ''
+        return "<?xml version=""1.0"" encoding=""UTF-8"" ?><testsuites name=""vitest tests"" tests=""2""><testsuite name=""tests/Features/CancelOrder.feature"" hostname=""DESKTOP-X"" tests=""2"" skipped=""0"">$cases</testsuite></testsuites>"
+    }
+    function Invoke-Ui([string]$spec, [string]$xml) {
+        New-GcProject -spec $spec
+        if (-not $xml) { return (Invoke-Gc) }
+        $f = Join-Path $GcRoot 'junit.xml'
+        [IO.File]::WriteAllText($f, $xml, $GcUtf8)
+        (Get-Item $f).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(1)
+        return (Invoke-Gc @{ TestResults = $f })
+    }
+    $Pw = '驗收方式：playwright｜chromium, mobile-safari｜1280x800、iPhone 13｜後端：替身（依 openapi.yaml）'
+
+    It-Should '驗收層是 UI 卻沒寫驗收方式 → 紅（沒給結果檔也擋：這是 spec 的問題）' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' '')
+            Assert-Equal 2 $r.exit "沒寫驗收方式卻通過：$($r.stdout)"
+            Assert-Match '沒有「驗收方式」' (@($r.json.results[0].ui_method_problems) -join '|')
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '少欄、第四欄沒講真實或替身、Playwright 沒寫 project、瀏覽器層寫元件工具 → 各自紅' {
+        try {
+            $cases = [ordered]@{
+                '四欄'         = '驗收方式：playwright｜chromium｜1280x800'
+                '第四欄'       = '驗收方式：playwright｜chromium｜1280x800｜後端：看情況'
+                'project'      = '驗收方式：playwright｜—｜1280x800｜後端：真實'
+                '元件測試工具' = '驗收方式：vitest｜—｜—｜後端：替身'
+            }
+            foreach ($k in $cases.Keys) {
+                $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $cases[$k])
+                Assert-Equal 2 $r.exit "「$($cases[$k])」應該紅：$($r.stdout)"
+                Assert-Match $k (@($r.json.results[0].ui_method_problems) -join '|')
+            }
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Playwright：每條 scenario 在宣告的每個 project 都通過 → 綠' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $Pw) (New-PwJunit @{ 'chromium' = @(); 'mobile-safari' = @() })
+            Assert-Equal 0 $r.exit "應該綠：$($r.stdout) $($r.stderr)"
+            Assert-Equal 'playwright' $r.json.results[0].ui_method.kind
+            Assert-Equal 'chromium|mobile-safari' (@($r.json.results[0].ui_method.projects) -join '|')
+            Assert-Equal 0 @($r.json.results[0].ui_projects_missing | Where-Object { $_ }).Count
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Playwright：只跑了其中一個 project（--project 過濾）→ 紅，指出缺哪一個' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $Pw) (New-PwJunit @{ 'chromium' = @() })
+            Assert-Equal 2 $r.exit "少跑一個 project 卻通過：$($r.stdout)"
+            $miss = @($r.json.results[0].ui_projects_missing)
+            Assert-Equal 2 $miss.Count
+            Assert-Equal 'mobile-safari' $miss[0].detail
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Playwright：某個 project 上失敗 → 紅（其他 project 通過不能抵）' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $Pw) (New-PwJunit @{ 'chromium' = @(); 'mobile-safari' = @('已出貨的訂單不能取消') })
+            Assert-Equal 2 $r.exit
+            $miss = @($r.json.results[0].ui_projects_missing)
+            Assert-Equal '已出貨的訂單不能取消' $miss[0].scenario
+            Assert-Equal 'mobile-safari' $miss[0].detail
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'Playwright 的 project 名稱大小寫要逐字一樣' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $Pw) (New-PwJunit @{ 'Chromium' = @(); 'mobile-safari' = @() })
+            Assert-Equal 2 $r.exit "Chromium ≠ chromium 卻通過：$($r.stdout)"
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '宣告 Playwright 卻給 Vitest 的結果（元件測試冒充瀏覽器層）→ 紅' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' $Pw) (New-VtJunit)
+            Assert-Equal 2 $r.exit "Vitest 結果冒充 Playwright 卻通過：$($r.stdout)"
+            Assert-Equal 2 @($r.json.results[0].ui_projects_missing).Count
+            Assert-Equal 0 @($r.json.results[0].scenarios_without_test | Where-Object { $_ }).Count   # 名字對得上，擋它的是第 6 項
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '元件層宣告 Vitest：Vitest 的 JUnit → 綠；給 Playwright 的 → 紅' {
+        $m = '- **驗收方式**：vitest（quickpickle）｜jsdom｜鍵盤操作｜後端：替身（依 OrderDto）'   # 列表、粗體的寫法也認
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（元件）' $m) (New-VtJunit)
+            Assert-Equal 0 $r.exit "應該綠：$($r.stdout) $($r.stderr)"
+            Assert-Equal 'vitest' $r.json.results[0].ui_method.kind
+            $r = Invoke-Ui (Get-UiSpec 'UI（元件）' $m) (New-PwJunit @{ 'chromium' = @() })
+            Assert-Equal 2 $r.exit "Playwright 的結果當成 Vitest 卻通過：$($r.stdout)"
+            Assert-Equal 2 @($r.json.results[0].ui_method_mismatch).Count
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '結果檔看不出的工具（cypress）不擋，交給 reviewer' {
+        try {
+            $r = Invoke-Ui (Get-UiSpec 'UI（瀏覽器）' '驗收方式：cypress｜chrome｜1280x800｜後端：真實') (New-PwJunit @{ 'x' = @() })
+            Assert-Equal 0 $r.exit "應該綠：$($r.stdout) $($r.stderr)"
+            Assert-Equal 'other' $r.json.results[0].ui_method.kind
+            Assert-True ($null -eq $r.json.results[0].ui_projects_missing) '沒有機械核對時應該是 null'
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '驗收層不是 UI → 不要求驗收方式（既有的 spec 照舊）' {
+        try {
+            $r = Invoke-Ui $GcSpec
+            Assert-Equal 0 $r.exit "非 UI 也被擋：$($r.stdout)"
+            Assert-True ($null -eq $r.json.results[0].ui_method) '非 UI 不該解析驗收方式'
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '迭代 2 沒重寫驗收層就沿用前面的；重寫了就照這次的' {
+        $fence = '```'
+        $it2 = "`n## 迭代 2 —— 加註記`n`n${fence}gherkin`n# feature-id: cancel-order`nFeature: 取消訂單`n  Scenario: 未出貨的訂單可以取消`n    Given 訂單 1001 的狀態是「已付款」`n$fence`n"
+        try {
+            $r = Invoke-Ui ((Get-UiSpec 'UI（瀏覽器）' '') + $it2)
+            Assert-Equal 2 $r.exit "迭代 1 是 UI、迭代 2 沒改層，應該照樣要驗收方式：$($r.stdout)"
+            $r = Invoke-Ui ((Get-UiSpec 'UI（瀏覽器）' '') + $it2 + "`n驗收層：application service`n")
+            Assert-Equal 0 $r.exit "迭代 2 改成 application service，不該再要驗收方式：$($r.stdout) $($r.stderr)"
+        } finally { Remove-Item $GcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}

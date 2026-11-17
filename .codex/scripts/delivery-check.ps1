@@ -184,13 +184,16 @@ if (-not $features.Count) {
             prior_scenarios_without_test = '前幾次迭代的 scenario 找不到測試'
             prior_scenarios_not_passed   = '前幾次迭代的 scenario 沒有全部通過'
             stale_results_newer          = '結果檔比這些改過的檔舊'
+            ui_method_problems           = '驗收方式'
+            ui_projects_missing          = '沒有在驗收方式宣告的 project 通過'
+            ui_method_mismatch           = '不是驗收方式宣告的工具跑的'
         }
         $items = @()
         foreach ($r in @($gc.results)) {
             $manual += @($r.manual_scenarios | Where-Object { $_ })
             foreach ($k in $labels.Keys) {
                 foreach ($v in @($r.$k | Where-Object { $_ })) {
-                    $txt = if ($v -is [string]) { $v } elseif ($v.scenario -and $v.step) { "$($v.scenario)：$($v.step)" } elseif ($v.scenario) { $v.scenario } else { [string]$v }
+                    $txt = if ($v -is [string]) { $v } elseif ($v.scenario -and $v.step) { "$($v.scenario)：$($v.step)" } elseif ($v.scenario -and $v.detail) { "$($v.scenario)（$($v.detail)）" } elseif ($v.scenario) { $v.scenario } else { [string]$v }
                     $items += "$($labels[$k])：$txt"
                 }
             }
@@ -199,7 +202,7 @@ if (-not $features.Count) {
         $gherkin.passed = [bool]$gc.passed
         if (-not $gc.passed) {
             $cmd = "pwsh -NoProfile -File .codex/scripts/gherkin-check.ps1 -Feature $($features -join ',')$(if ($useResults.Count) { " -TestResults $($useResults -join ',')" })"
-            Add-Problem 'gherkin' 'gherkin-check 沒過' "結果檔過期 → 請 implementer 重跑全套測試、給新的結果檔；其餘是實作的問題 → 交回 implementer（mode: fix）。全文：$cmd" $items
+            Add-Problem 'gherkin' 'gherkin-check 沒過' "驗收方式沒寫或寫不完整 → 回 ③ 在驗收層底下補「驗收方式」、跟使用者確認；結果檔過期 → 請 implementer 重跑全套測試、給新的結果檔；其餘是實作的問題 → 交回 implementer（mode: fix）。全文：$cmd" $items
         }
     }
 }
