@@ -521,6 +521,7 @@ Describe-Suite 'sdlc / -Json 是結構化合約（改措辭不紅、改欄位名
                 lint       = @{ ran = 'bool'; passed = 'bool'; violations = 'array' }
                 review     = @{ maxRounds = 'int'; source = 'string'; valid = 'bool' }
                 hooks      = @{ status = 'string' }
+                gitHooks   = @{ marker = 'bool'; repos = 'array' }
                 update     = @{ cached = 'bool'; stale = 'bool'; newer = 'bool'; latest = 'string?'; seen = 'bool'; checkedAt = 'any'; check = 'string' }
                 editor     = @{ installed = 'array' }
                 problems   = 'int'
@@ -2931,6 +2932,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Assert-Match 'allow_managed_hooks_only' $w
             Assert-Match 'managed-hooks' $w
             Assert-Match 'delivery-check' $w '沒講部署之前還剩哪一道'
+            Assert-Match 'git-hooks' $w '管理員不部署時，不靠他也做得到的那一層沒講'
             Assert-True ($j.data.hooks.policy.managedOnly) 'data 沒帶政策（extension 讀 data）'
         } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -2969,6 +2971,120 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             $j = Invoke-PolicyDoctor "allow_managed_hooks_only = true`n" @{ FAKE_TRUST = 'none' } -Check
             Assert-Equal 'managed-only' $j.data.hooks.status
             Assert-True (-not ((@($j.warnings) -match 'Trust all and continue').Count)) '叫人去按一個不存在的按鈕'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe-Suite 'sdlc git-hooks / 管理員不部署 managed hooks 時，commit 前補跑三道' {
+
+    # git 不歸 allow_managed_hooks_only 管。這一組守的是：裝到對的地方、不蓋掉別人的 hook、真的 commit 時真的擋。
+    $GhUtf8 = [Text.UTF8Encoding]::new($false)
+    function New-GhProject([string]$name, [string[]]$repos = @('.'), [switch]$WithScripts) {
+        $t = New-SdlcTarget $name
+        New-SdlcFile (Join-Path $t '.codex/bdd-workflow/bdd-workflow-version.json') '{ "contract-version": "4.30.0", "min-compatible-version": "4.2.0" }'
+        if ($WithScripts) { Copy-Item '.codex/scripts' (Join-Path $t '.codex/scripts') -Recurse }
+        foreach ($r in $repos) {
+            $d = if ($r -eq '.') { $t } else { Join-Path $t $r }
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            $null = & git -C $d init -q 2>&1
+        }
+        return $t
+    }
+    function Get-GhHookFile([string]$repoDir) { return (Join-Path $repoDir '.git/hooks/pre-commit') }
+
+    It-Should '單一 repo：裝在 .git/hooks/pre-commit、寫 no-codex-hooks 標記；重跑一次不變' {
+        try {
+            $t = New-GhProject 'gh-one'
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t }
+            Assert-Equal 0 $j.exit "warnings: $($j.warnings -join ' | ')"
+            Assert-Equal 'installed' @($j.data.gitHooks.repos)[0].status
+            $hook = Get-GhHookFile $t
+            Assert-True (Test-Path $hook) 'pre-commit 不在 .git/hooks'
+            $text = [IO.File]::ReadAllText($hook)
+            Assert-True ($text.StartsWith("#!/bin/sh`n")) 'git 在 Windows 也用 sh 跑 hook —— 少了 shebang 或換行是 CRLF 就跑不起來'
+            Assert-True ($text -notmatch "`r") 'hook 裡有 CR —— sh 會把它當成指令的一部分'
+            Assert-Match 'commit-check\.ps1' $text
+            Assert-True (Test-Path (Join-Path $t 'bdd-docs/.cache/no-codex-hooks')) '沒寫標記 —— orchestrator 不會知道要自己跑 handoff-lint'
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t }
+            Assert-Equal 0 $j.exit
+            Assert-Equal $text ([IO.File]::ReadAllText($hook)) '重跑改了內容'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '真的 git commit：bdd-docs/ 有 email 的那次被擋、沒有 commit 產生；改乾淨就過' {
+        try {
+            $t = New-GhProject 'gh-e2e' -WithScripts
+            Assert-Equal 0 (Invoke-SdlcJson 'git-hooks' @{ Target = $t }).exit
+            New-SdlcFile (Join-Path $t 'bdd-docs/f/spec.md') "聯絡人：alice@example.com`n"
+            $null = & git -C $t add -A 2>&1
+            $out = & git -C $t -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m bad 2>&1
+            Assert-True ($LASTEXITCODE -ne 0) "commit 沒被擋：$($out -join ' ')"
+            Assert-Match 'dlp-residual' ($out -join ' ')
+            $null = & git -C $t rev-parse --verify -q HEAD 2>&1
+            Assert-True ($LASTEXITCODE -ne 0) '被擋了卻還是產生了 commit'
+            New-SdlcFile (Join-Path $t 'bdd-docs/f/spec.md') "聯絡人：{客服信箱}`n"
+            $null = & git -C $t add -A 2>&1
+            $out = & git -C $t -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m ok 2>&1
+            Assert-Equal 0 $LASTEXITCODE "乾淨的 commit 被擋：$($out -join ' ')"
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '前後端各一個 repo（工作流在上層）：兩個 repo 都裝' {
+        try {
+            $t = New-GhProject 'gh-two' @('backend', 'frontend')
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t }
+            Assert-Equal 0 $j.exit "warnings: $($j.warnings -join ' | ')"
+            Assert-Equal 2 @($j.data.gitHooks.repos | Where-Object status -eq 'installed').Count
+            foreach ($r in 'backend', 'frontend') { Assert-True (Test-Path (Get-GhHookFile (Join-Path $t $r))) "$r 沒裝" }
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '已經有自己的 pre-commit → 一個字都不動、exit 2、給要加的那一行；設了 core.hooksPath → 不寫' {
+        try {
+            $t = New-GhProject 'gh-foreign'
+            $hook = Get-GhHookFile $t
+            [IO.File]::WriteAllText($hook, "#!/bin/sh`nnpx lint-staged`n", $GhUtf8)
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t }
+            Assert-Equal 2 $j.exit '別人的 hook 沒裝成，卻回成功'
+            Assert-Equal 'foreign' @($j.data.gitHooks.repos)[0].status
+            Assert-Equal "#!/bin/sh`nnpx lint-staged`n" ([IO.File]::ReadAllText($hook)) '蓋掉了別人的 pre-commit'
+            Assert-Match 'commit-check\.ps1' $j.data.gitHooks.manualLine
+
+            $t2 = New-GhProject 'gh-hookspath'
+            $null = & git -C $t2 config core.hooksPath .husky 2>&1
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t2 }
+            Assert-Equal 2 $j.exit
+            Assert-Equal 'hooks-path' @($j.data.gitHooks.repos)[0].status
+            Assert-True (-not (Test-Path (Join-Path $t2 '.husky/pre-commit'))) '寫進了 core.hooksPath 指的目錄（可能是進版控的 .husky、或公司統一的 hooks）'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '-Remove：拿掉這套裝的與標記，別人的照留' {
+        try {
+            $t = New-GhProject 'gh-rm' @('a', 'b')
+            Assert-Equal 0 (Invoke-SdlcJson 'git-hooks' @{ Target = $t }).exit
+            $other = Get-GhHookFile (Join-Path $t 'b')
+            [IO.File]::WriteAllText($other, "#!/bin/sh`necho mine`n", $GhUtf8)
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $t; Remove = $true }
+            Assert-Equal 0 $j.exit
+            Assert-True (-not (Test-Path (Get-GhHookFile (Join-Path $t 'a')))) '沒拿掉'
+            Assert-True (Test-Path $other) '刪了別人的 hook'
+            Assert-True (-not (Test-Path (Join-Path $t 'bdd-docs/.cache/no-codex-hooks'))) '標記還在 —— orchestrator 會繼續自己跑 handoff-lint'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should 'doctor 的 data.gitHooks 看得到裝了哪幾個 repo 與標記；沒裝工作流 → exit 2' {
+        try {
+            $t = New-GhProject 'gh-doc'
+            Assert-Equal 0 (Invoke-SdlcJson 'git-hooks' @{ Target = $t }).exit
+            $p = Get-IsolatedDoctorParams $t
+            $j = Invoke-SdlcJson doctor $p -Env @{ PATH = $env:PATH }
+            Assert-True $j.data.gitHooks.marker
+            Assert-Equal 'installed' @($j.data.gitHooks.repos)[0].status
+            $empty = New-SdlcTarget 'gh-none'
+            $j = Invoke-SdlcJson 'git-hooks' @{ Target = $empty }
+            Assert-Equal 2 $j.exit
+            Assert-Equal 'not-installed' $j.data.error
         } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

@@ -17,6 +17,10 @@
 #   4. 禁用 payload：完整 log、長測試輸出、connection string、secret、DLP mapping table
 #   5. 這次 spawn 會不會被 Codex 拒絕：effort 不在 agent 實際用的模型支援之列（v4.15.0；只判得準的才擋）
 #
+# -SelfCheck（v4.30.0）：Codex 的 hooks 跑不起來的機器（組織政策只允許管理員部署的 hooks，見 sdlc.ps1 git-hooks），
+# orchestrator 在 spawn 前把同一份 handoff 從 stdin 交給這支。檢查完全一樣；差別只有兩件 hook 在叫時才做的事：
+# 修正輪的帳照記（不然 3c 永遠判不出來），放行時要說的話（修正輪 N／上限 M、更新通知）印在 stdout。
+#
 # 自 v4.0.0 起移除：tier 相關檢查、t0 零 spawn、discover 交付型 mode、
 # 單點紀錄 mode、subagent 預算上限、successor 額度繼承。
 # 那些檢查全部服務於 12-agent 的扇出控制；agent 收斂到 5 個、流程改為線性之後
@@ -31,6 +35,7 @@ param(
     [int]$MaxChars = 1200,
     [int]$MaxReviewRounds = 3,                 # 明確給了就用它（測試用）；沒給就看設定檔
     [string]$ConfigFile = 'sdlc.config.json',
+    [switch]$SelfCheck,                        # 沒有 Codex hooks 時 orchestrator 自己跑（見檔頭）
     [switch]$Json
 )
 
@@ -396,8 +401,8 @@ if ($violations.Count -gt 0) {
     exit 2
 }
 
-# 修正輪的帳只在放行、而且是 hook 在叫的時候記（手動跑、-Json 都不算一輪）。寫不進去就算了 —— 帳是線索，不是 gate。
-if ($ledgerPath -and $ledgerData -and $hookEvent -and -not $Json) {
+# 修正輪的帳只在放行、而且是 hook 在叫（或 -SelfCheck）的時候記（手動跑、-Json 都不算一輪）。寫不進去就算了 —— 帳是線索，不是 gate。
+if ($ledgerPath -and $ledgerData -and ($hookEvent -or $SelfCheck) -and -not $Json) {
     try {
         [void][IO.Directory]::CreateDirectory((Split-Path (Join-Path (Get-Location).Path $ledgerPath) -Parent))
         [IO.File]::WriteAllText((Join-Path (Get-Location).Path $ledgerPath), ($ledgerData | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
@@ -460,6 +465,11 @@ try {
 if ($contextLines.Count -gt 0 -and $hookEvent -and -not $Json) {
     [Console]::Out.WriteLine((@{ hookSpecificOutput = @{ hookEventName = $hookEvent; additionalContext = ($contextLines -join "`n") } } |
                               ConvertTo-Json -Compress -Depth 4))
+}
+# -SelfCheck：orchestrator 讀的是這支的 stdout（沒有 hook 替它轉成 additionalContext）。
+if ($SelfCheck -and -not $hookEvent -and -not $Json) {
+    [Console]::Out.WriteLine("[handoff-lint] 通過 —— 照同一份送出。")
+    foreach ($l in $contextLines) { [Console]::Out.WriteLine($l) }
 }
 
 exit 0

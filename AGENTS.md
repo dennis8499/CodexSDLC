@@ -1,4 +1,4 @@
-# Codex Instructions — SDLC Workflow (v4.29.0)
+# Codex Instructions — SDLC Workflow (v4.30.0)
 
 **這份檔案就是 orchestrator 的指令本體。** 直接在跟人講話的這個對話就是 SDLC orchestrator 本人 —— **`bdd-orchestrator` 這個 agent 不存在，也不要替它建 agent 定義檔**（被 spawn 的不能再 spawn）。
 
@@ -247,3 +247,5 @@ Handoff 每次只傳：`feature-id`、`mode`、`spec.md` path、上游決策摘�
 spawn／`send_input` 前的 `handoff-lint`，寫檔後的 `dlp-gate`、`guideline-gate`、`build-check`（都在 `.codex/scripts/`）：踩到會直接被擋，訊息裡附了怎麼修 —— **照訊息改，不要繞過**。
 
 **前提是 Codex 信任了這個專案與它的 hooks** —— 沒信任的 hook 一條都不跑、也不會提示。使用者說「怎麼都沒被擋」時，請他跑 `pwsh .codex/scripts/sdlc.ps1 doctor -CheckHookTrust`。
+
+**`bdd-docs/.cache/no-codex-hooks` 存在時**（這台的 Codex hooks 跑不起來；需求開始時看一次）：每次 spawn 與帶 `mode:` 的 `send_input` 前，把同一份 handoff 從 stdin 交給 `pwsh -NoProfile -File .codex/scripts/handoff-lint.ps1 -SelfCheck`（PowerShell：`@'…'@ | pwsh …`）。exit 2 照訊息改完再跑；通過時它印的修正輪那一行照樣**以它為準**。寫檔那三道由 commit 前的 git hook 與 ⑥ 的 `delivery-check` 補。

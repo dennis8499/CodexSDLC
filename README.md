@@ -26,7 +26,7 @@
    - 由 Codex 自己把信任寫入 `~/.codex/config.toml`，與在終端機的 `codex` 選 **Trust all and continue** 相同。只信任本工作流的 hooks，其他 hook 不處理。
    - VS Code 的 Codex chat 不會顯示「Hooks need review」，只用 chat 時須以此方式信任。
    - `PATH` 上沒有 `codex` 時，改用 OpenAI VS Code 擴充內附的 `codex`；仍找不到時加 `-CodexPath <codex 完整路徑>`。
-   - 組織政策僅允許管理員部署的 hooks（`allow_managed_hooks_only`）時不會出現此畫面：請管理員部署 `sdlc.ps1 managed-hooks -OutDir <資料夾>` 產生的腳本與 `requirements.toml` 片段。部署前，`delivery-check` 於交付前補跑殘留掃描與規範檢查。
+   - 組織政策僅允許管理員部署的 hooks（`allow_managed_hooks_only`）時不會出現此畫面：請管理員部署 `sdlc.ps1 managed-hooks -OutDir <資料夾>` 產生的腳本與 `requirements.toml` 片段。管理員不部署時，見「[組織政策不允許專案 hooks](#組織政策不允許專案-hooks)」。
 3. **檢查**：`pwsh .codex/scripts/sdlc.ps1 doctor`；確認 hooks 信任狀態加 `-CheckHookTrust`。
 4. **使用**：於專案中啟動 Codex，直接描述需求。每個需求請開新對話。
 
@@ -112,6 +112,31 @@ pwsh .codex/scripts/sdlc.ps1 set -Preset balanced   # fast／balanced／deep
 
 `guidelines/` 的 `*.md` 為需判斷的規範（違反 MUST 判為必修），`rules.json` 為寫檔時機械檢查的規則。寫法見 `.codex/bdd-workflow/guidelines-guide.md`。
 
+## 組織政策不允許專案 hooks
+
+`allow_managed_hooks_only = true` 且管理員不部署 `managed-hooks` 時，Codex 不會執行任何一條 hook。此政策只約束 Codex，不約束 git：
+
+```powershell
+pwsh .codex/scripts/sdlc.ps1 git-hooks
+```
+
+- **commit 前檢查**：工作區每個 repo 安裝 `pre-commit`（位於 `.git/hooks`，每份 clone 各自一份、不進版控），執行 `.codex/scripts/commit-check.ps1`：staged 的 `bdd-docs/` 檔做殘留掃描，其餘檔套用 `rules.json` 的 block 規則，含 production 程式碼時 build。
+- **委派前檢查**：寫入 `bdd-docs/.cache/no-codex-hooks`；orchestrator 見到此檔即於每次委派前自行執行 `handoff-lint -SelfCheck`。此項依賴模型遵守，不是機械強制。
+- **CI**：`git commit --no-verify` 可略過本機檢查。需強制時於 pipeline 執行（clone 須含完整歷史）：
+
+  ```powershell
+  pwsh -NoProfile -File .codex/scripts/commit-check.ps1 -Base origin/main
+  ```
+
+  工作流裝於上層、前後端各一個 repo 時，單一 repo 的 pipeline 內沒有 `.codex/`，無法以此方式執行。
+
+限制：
+- 問題在 commit 前才被發現，不是寫檔當下，修正成本較高。
+- 檢查的是工作區內容；stage 後又修改的檔會列出提醒。
+- 審核紀錄的「上一輪必修交代」檢查與審核快照仍需 Codex hooks。
+- repo 已有自己的 `pre-commit` 或設定了 `core.hooksPath` 時不覆蓋，改為列出需自行加入的一行。
+- 移除：`git-hooks -Remove`。管理員日後部署 managed hooks 時應移除，否則委派前會重複檢查。
+
 ## VS Code extension（選用）
 
 設定面板、狀態列與 Problems 標示；詳見 [vscode-extension/README.md](vscode-extension/README.md)。
@@ -132,7 +157,8 @@ pwsh <新版目錄>/.codex/scripts/sdlc.ps1 update -Target <專案路徑>   # -P
 | --- | --- |
 | 違規內容未被阻擋，或顯示「hooks 沒在跑」 | 執行 `trust-hooks`（extension：「在 Codex 信任 hooks」）；以 `doctor -CheckHookTrust` 確認。已開啟的 Codex 對話須開新對話 |
 | `trust-hooks` 回報 `project-untrusted` | Codex 認定的專案根不是此目錄（例如位於另一個 git repo 內）；於該目錄以終端機啟動 `codex` 依提示信任 |
-| 未出現「Hooks need review」、`doctor` 回報 `allow_managed_hooks_only` | 組織政策所致；由管理員部署 `managed-hooks` 的產出 |
+| 未出現「Hooks need review」、`doctor` 回報 `allow_managed_hooks_only` | 組織政策所致；由管理員部署 `managed-hooks` 的產出，或執行 `git-hooks`（見「組織政策不允許專案 hooks」） |
+| commit 被擋：`[commit-check]` | 依列出的項目修正後重新 `git add` |
 | `gherkin-check`：找不到 scenario 的測試 | 確認 step 已繫結、結果檔為全套測試；手動測試者標 `@manual` |
 | `gherkin-check`：結果檔比改過的檔舊 | 重跑測試 |
 | 委派被擋：`review-loop-exceeded`／`review-item-stuck` | 由使用者決定後續 |

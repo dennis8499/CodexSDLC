@@ -1587,7 +1587,7 @@ export function trustSentence(t: TrustData): string {
     case 'nothing-to-trust': return 'hooks.json 裡沒有這套工作流的 hook，沒有要信任的。';
     case 'cancelled': return '沒有信任 hooks（已取消）。';
     case 'codex-not-found': return '沒有信任 hooks：找不到 codex 執行檔（PATH 上沒有，OpenAI 的 VS Code 擴充裡也沒找到）—— 在終端機開 codex 信任。';
-    case 'managed-only': return '沒有信任 hooks：組織政策只允許管理員部署的 hooks —— 請管理員部署（sdlc.ps1 managed-hooks）。';
+    case 'managed-only': return '沒有信任 hooks：組織政策只允許管理員部署的 hooks —— 請管理員部署（sdlc.ps1 managed-hooks）；管理員不部署時，跑 sdlc.ps1 git-hooks 補上 commit 前的檢查。';
     default: return `hooks 沒有信任成功（${t.result}）—— 強制層還沒在跑。`;
   }
 }

@@ -25,6 +25,7 @@
 param(
     [switch]$Managed,                                   # managed hooks（管理員部署在專案外）：沒裝工作流的專案一律放行
     [string]$Payload,
+    [string[]]$Path,                                    # 直接指定檔案（commit-check 用：commit 前補跑的那一次），跳過 payload 解析
     [string]$IndexPath = 'bdd-docs/.cache/index.json',
     [int]$DebounceSeconds = 90,   # 0 = 停用去抖（每次都 build）
     [switch]$WhatIfPaths   # 只印出判定結果，不實際 build（測試用）
@@ -136,12 +137,15 @@ function Write-HookHeartbeat([string]$eventName, [string]$name) {
     } catch { }
 }
 
-if (-not $Payload) { $Payload = Read-StdinUtf8 }
-if (-not $Payload) { exit 0 }
-
-$hook = Read-HookPayload $Payload
-Write-HookHeartbeat $hook.event 'build-check'
-$paths = $hook.paths
+if ($Path) {
+    $paths = @($Path)   # 手動／commit-check：不是 hook 在叫，不寫心跳
+} else {
+    if (-not $Payload) { $Payload = Read-StdinUtf8 }
+    if (-not $Payload) { exit 0 }
+    $hook = Read-HookPayload $Payload
+    Write-HookHeartbeat $hook.event 'build-check'
+    $paths = $hook.paths
+}
 
 # 語言／建置命令：優先取自索引，退化為副檔名偵測
 $buildCmd = $null
@@ -292,8 +296,9 @@ foreach ($d in $nodeUnits.Keys) {
         [Console]::Error.WriteLine("[Hook] Type check FAILED after production code change ($cmd, in $relDir). Fix before proceeding.")
         Select-ErrorLines $out | ForEach-Object { [Console]::Error.WriteLine($_) }
         $nodeFailed = $true
-    } elseif ($DebounceSeconds -gt 0) {
-        Set-Content -Path $nstamp -Value (Get-Date -Format o) -NoNewline
+    } else {
+        if ($DebounceSeconds -gt 0) { Set-Content -Path $nstamp -Value (Get-Date -Format o) -NoNewline }
+        if ($Path) { [Console]::Out.WriteLine("[build-check] built: $cmd in $(([IO.Path]::GetRelativePath((Get-Location).Path, $d)) -replace '\\', '/')") }
     }
 }
 
@@ -352,4 +357,6 @@ if ($buildExit -ne 0) {
 }
 # 綠燈：記錄時間戳，開啟去抖視窗。
 if ($DebounceSeconds -gt 0) { Set-Content -Path $stamp -Value (Get-Date -Format o) -NoNewline }
+# -Path（commit-check）：說一聲真的 build 過了 —— exit 0 也可能是「沒有要 build 的」。hook 模式不寫 stdout。
+if ($Path) { [Console]::Out.WriteLine("[build-check] built: $buildCmd$inDir") }
 exit $(if ($nodeFailed) { 2 } else { 0 })

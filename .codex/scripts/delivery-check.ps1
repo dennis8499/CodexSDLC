@@ -258,7 +258,7 @@ if ($dlpTargets.Count) {
     else {
         $gates.dlp = if ($dlp.passed) { 'passed' } else { 'failed' }
         if (-not $dlp.passed) {
-            Add-Problem 'dlp-residual' 'bdd-docs/ 的產出有殘留的敏感資料樣式（只列類別與行號）' '刪掉那個檔，遮蔽後重產（敏感值換成占位符；DB 結果只留結構與筆數）；改完再跑一次' @($dlp.findings | ForEach-Object { "$($_.file)：$(@($_.categories) -join '、')（行 $(@($_.lines) -join ',')）" })
+            Add-Problem 'dlp-residual' 'bdd-docs/ 的產出有殘留的敏感資料樣式（只列類別與行號）' '刪掉那個檔，遮蔽後重產（敏感值換成占位符；DB 結果只留結構與筆數）；改完再跑一次' @($dlp.findings | ForEach-Object { "$($_.file)：$(@($_.categories | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.type } }) -join '、')（行 $(@($_.lines) -join ',')）" })
         }
     }
 }

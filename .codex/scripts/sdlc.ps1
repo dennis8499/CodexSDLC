@@ -31,7 +31,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'update', 'check-update', 'apply', 'set', 'tune', 'doctor', 'whatsnew', 'fetch', 'models', 'learn', 'managed-hooks', 'trust-hooks')]
+    [ValidateSet('install', 'update', 'check-update', 'apply', 'set', 'tune', 'doctor', 'whatsnew', 'fetch', 'models', 'learn', 'managed-hooks', 'trust-hooks', 'git-hooks')]
     [string]$Command = 'doctor',
 
     [string]$Source,                       # 發佈物根目錄；預設 = 本腳本所在的工作流根
@@ -57,6 +57,7 @@ param(
     [string]$OutDir,                       # managed-hooks 用：部署包寫到哪個資料夾
     [string]$ManagedDir = 'C:\enterprise\hooks',   # managed-hooks 用：requirements.toml 的 windows_managed_dir
     [string]$UnixManagedDir = '/enterprise/hooks', # managed-hooks 用：requirements.toml 的 managed_dir（macOS／Linux）
+    [switch]$Remove,                       # git-hooks 用：拿掉這套裝的 pre-commit 與 no-codex-hooks 標記
     [string]$EditorHome,                   # 找已安裝 extension 的家目錄（預設 = 使用者家目錄；測試用）
     [switch]$Yes,                          # 非互動確認
     [switch]$Json,
@@ -94,6 +95,7 @@ $BaselineRel = "$StateDir/installed-manifest.json"
 $CacheRel    = "$StateDir/update-cache.json"
 $ProposalRel = "$StateDir/tuning-proposal.json"
 $HeartbeatRel = 'bdd-docs/.cache/hooks'                     # 四支 hook 的 Write-HookHeartbeat 寫的地方
+$NoHooksMarkerRel = 'bdd-docs/.cache/no-codex-hooks'        # git-hooks 寫：這台的 Codex hooks 跑不起來（AGENTS.md 叫 orchestrator 自己跑 handoff-lint）
 $GuideReadmeRel = 'guidelines/README.md'
 $GuideStockRel  = '.codex/bdd-workflow/guidelines-readme-stock.json'   # 歷來原廠 README 的雜湊（見 Get-GuidelinesReadmeState）
 
@@ -142,6 +144,10 @@ $BundledGiven = $PSBoundParameters.ContainsKey('Bundled')
 
 if (-not $Source) { $Source = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path }
 if (-not $EditorHome) { $EditorHome = [Environment]::GetFolderPath('UserProfile') }
+
+# 工作區裡有哪幾個 git repo（git-hooks 與 doctor 用；判法跟 delivery-check 同一份）。只複製了這支腳本時沒有它 —— 用到的地方會跳過。
+$WorkspaceLib = Join-Path $PSScriptRoot 'lib/workspace-repos.ps1'
+if (Test-Path -LiteralPath $WorkspaceLib) { . $WorkspaceLib }
 
 # 路徑不存在時給一句人看得懂的話，而不是讓 Resolve-Path 丟出堆疊 ——
 # 「擋下的理由跟使用者要做的事無關，而且他也修不了」是這套流程踩過兩次的失敗形狀。
@@ -806,6 +812,12 @@ function Get-HookTrust([string]$target) {
 function Show-ManagedOnlyPolicy($policy) {
     $have = if ($policy.ours.Count) { "它只登記了 $($policy.ours -join '、')。" } else { '它沒有登記這套工作流的 hooks。' }
     Warn "組織政策只允許管理員部署的 hooks（$($policy.path) 的 allow_managed_hooks_only）—— 專案的 hooks.json 一律被略過，不會出現「Hooks need review」，也沒有東西可以按。$have 請管理員部署：pwsh .codex/scripts/sdlc.ps1 managed-hooks -OutDir <資料夾> 產生腳本與 requirements 片段。在那之前寫檔與委派沒有人當下擋；⑥ 的 delivery-check 會在交付前補跑殘留掃描與規範的 block 規則。"
+    # 管理員不部署時，不靠他就做得到的那一層（git 不歸這個政策管）。
+    # 裝好了就不再講（doctor 的 Show-GitHooks 會報一行）。
+    $gh = Get-GitHooksStatus $Target
+    $ok = @($gh.repos | Where-Object { $_.status -in @('installed', 'outdated') })
+    if ($gh.marker -and $ok.Count -and $ok.Count -eq @($gh.repos).Count) { return }
+    Warn "管理員不部署的話，不靠他也做得到的一層：pwsh .codex/scripts/sdlc.ps1 git-hooks —— commit 前補跑殘留掃描、規範的 block 規則與 build（git 不歸這個政策管），委派前改由 orchestrator 自己跑 handoff-lint。"
 }
 
 function Show-HookTrust($trust) {
@@ -3119,6 +3131,9 @@ function Invoke-Doctor {
     $heartbeat = Get-HookHeartbeat $Target
     $script:Data.heartbeat = $heartbeat
     $problems += (Show-HookHeartbeat $heartbeat)
+    $gitHooks = Get-GitHooksStatus $Target
+    $script:Data.gitHooks = $gitHooks
+    Show-GitHooks $gitHooks
 
     $envItems = @(Get-EnvironmentReport $Target)
     $script:Data.environment = @($envItems)
@@ -3369,6 +3384,150 @@ function Invoke-ManagedHooks {
     return 0
 }
 
+# ---- git-hooks：管理員不部署 managed hooks 時，不靠他也做得到的那一層（4.30.0）----
+# allow_managed_hooks_only 管的是 Codex，管不到 git。這裡做兩件事：
+#   1. 工作區每個 repo 裝一個 pre-commit，commit 前跑 .codex/scripts/commit-check.ps1（殘留掃描、規範的 block 規則、build）。
+#      裝在 git 自己的 hooks 目錄（git rev-parse --git-path）—— 每份 clone 各自一份、不進版控：這是「這台機器的 Codex
+#      hooks 跑不起來」的補位，不是整個團隊的設定。repo 已經有自己的 pre-commit、或設了 core.hooksPath（husky、公司統一的
+#      hooks）→ 一個字都不動，給一行讓人自己加進去：蓋掉別人的 hook 比沒裝更糟。
+#   2. 寫 bdd-docs/.cache/no-codex-hooks：AGENTS.md 叫 orchestrator 看到它就在每次委派前自己跑 handoff-lint -SelfCheck
+#      （委派的內容不落地、不經過 git，沒有機械的替代）。
+# hook 本身只負責找到工作流、叫 commit-check：規則都在 commit-check 與三支 gate 裡，update 升級它們，hook 不必重裝。
+$GitHookMarker = 'codex-sdlc pre-commit'
+function Get-GitHookText([string]$root) {
+    $hint = ($root -replace '\\', '/') -replace "'", "'\''"
+    $t = @'
+#!/bin/sh
+# codex-sdlc pre-commit —— sdlc.ps1 git-hooks 產生；重跑會更新，git-hooks -Remove 拿掉。
+# Codex 的 hooks 跑不起來時（組織政策只允許管理員部署的 hooks），寫檔當下沒有人擋 ——
+# commit 前在這裡補跑殘留掃描、規範的 block 規則與 build（.codex/scripts/commit-check.ps1）。
+# 先找裝的時候記下的工作流根目錄；移走了就從這個 repo 往上找兩層（工作流裝在上層、前後端各一個 repo）。
+top=$(git rev-parse --show-toplevel) || exit 0
+hint='{{ROOT}}'
+for d in "$hint" "$top" "$(dirname "$top")" "$(dirname "$(dirname "$top")")"; do
+  [ -f "$d/.codex/scripts/commit-check.ps1" ] || continue
+  if ! command -v pwsh >/dev/null 2>&1; then
+    echo "[codex-sdlc] 找不到 pwsh —— commit 前的檢查沒有跑。" >&2
+    exit 0
+  fi
+  cd "$d" || exit 0
+  exec pwsh -NoProfile -ExecutionPolicy Bypass -File .codex/scripts/commit-check.ps1 -Repo "$top"
+done
+echo "[codex-sdlc] 找不到 .codex/scripts/commit-check.ps1 —— commit 前的檢查沒有跑（工作流移走了：重跑 sdlc.ps1 git-hooks；不要了：git-hooks -Remove）。" >&2
+exit 0
+'@
+    return ($t -replace "`r`n", "`n").Replace('{{ROOT}}', $hint)
+}
+
+# 已經有自己 pre-commit 的 repo，要人自己加的那一行（括號：cd 不能影響那支 hook 後面的指令）。
+function Get-GitHookManualLine([string]$root) {
+    return "(cd '$(($root -replace '\\', '/') -replace "'", "'\''")' && pwsh -NoProfile -ExecutionPolicy Bypass -File .codex/scripts/commit-check.ps1 -Repo `"`$(git rev-parse --show-toplevel)`") || exit 1"
+}
+
+# 一個 repo 的 pre-commit：installed（是這一版的）｜outdated（是這套裝的、內容不同）｜missing｜foreign（別人的）｜
+# hooks-path（設了 core.hooksPath，不歸這裡寫）｜error
+function Get-GitHookState([string]$repoDir, [string]$root) {
+    $hp = Invoke-GitUtf8 $repoDir @('config', '--get', 'core.hooksPath')
+    $hooksPath = if ($hp.ok -and $hp.lines.Count) { [string]$hp.lines[0] } else { $null }
+    $gp = Invoke-GitUtf8 $repoDir @('rev-parse', '--git-path', 'hooks/pre-commit')
+    if (-not $gp.ok -or -not $gp.lines.Count) { return [ordered]@{ file = $null; status = 'error'; hooksPath = $hooksPath } }
+    $file = [string]$gp.lines[0]
+    if (-not [IO.Path]::IsPathRooted($file)) { $file = Join-Path $repoDir $file }
+    $file = [IO.Path]::GetFullPath($file)
+    $status = if (Test-Path -LiteralPath $file -PathType Leaf) {
+        $text = [IO.File]::ReadAllText($file) -replace "`r`n", "`n"
+        if (-not $text.Contains($GitHookMarker)) { if ($hooksPath) { 'hooks-path' } else { 'foreign' } }
+        elseif ($text -eq (Get-GitHookText $root)) { 'installed' }
+        else { 'outdated' }
+    } elseif ($hooksPath) { 'hooks-path' } else { 'missing' }
+    return [ordered]@{ file = $file; status = $status; hooksPath = $hooksPath }
+}
+
+function Get-GitHooksStatus([string]$target) {
+    $root = (Resolve-Path -LiteralPath $target).Path
+    $out = [ordered]@{ marker = (Test-Path -LiteralPath (Join-Path $root $NoHooksMarkerRel) -PathType Leaf); repos = @() }
+    if (-not (Get-Command Get-WorkspaceRepos -ErrorAction SilentlyContinue) -or -not (Get-Command git -ErrorAction SilentlyContinue)) { return $out }
+    $out.repos = @(foreach ($r in @(Get-WorkspaceRepos $root)) {
+        $s = Get-GitHookState $r.dir $root
+        [ordered]@{ repo = $(if ($r.rel) { $r.rel } else { '.' }); file = $s.file; status = $s.status; hooksPath = $s.hooksPath }
+    })
+    return $out
+}
+
+# doctor：只報、不算問題（沒有 Codex hooks 的那個問題已經由 Show-HookTrust 算過了）。
+function Show-GitHooks($gh) {
+    $mine = @($gh.repos | Where-Object { $_.status -in @('installed', 'outdated') })
+    if (-not $mine.Count -and -not $gh.marker) { return }
+    if ($mine.Count) {
+        Say "commit 前的檢查（git-hooks）：裝在 $(@($mine | ForEach-Object { $_.repo }) -join '、')$(if ($mine.Count -lt @($gh.repos).Count) { "（共 $(@($gh.repos).Count) 個 repo）" })。"
+    }
+    if (@($mine | Where-Object status -eq 'outdated').Count) { Say '  其中有舊版的 pre-commit —— 重跑 sdlc.ps1 git-hooks 更新。' }
+    if ($gh.marker) { Say "  $NoHooksMarkerRel 在：orchestrator 每次委派前自己跑 handoff-lint。Codex hooks 能跑了（管理員部署了 managed hooks）就 git-hooks -Remove。" }
+    elseif ($mine.Count) { Say "  $NoHooksMarkerRel 不在：orchestrator 不會自己跑 handoff-lint —— Codex hooks 跑不起來的話重跑 sdlc.ps1 git-hooks。" }
+}
+
+function Invoke-GitHooks {
+    $v = Get-ContractVersion $Target
+    if (-not $v) { Warn "$VersionRel 不存在 —— 這裡沒裝工作流（commit-check 要在工作流的根目錄跑）。"; $script:Data.error = 'not-installed'; return 2 }
+    $root = (Resolve-Path -LiteralPath $Target).Path
+    $marker = Join-Path $root $NoHooksMarkerRel
+    $results = @()
+    $haveGit = (Get-Command Get-WorkspaceRepos -ErrorAction SilentlyContinue) -and (Get-Command git -ErrorAction SilentlyContinue)
+    $repos = if ($haveGit) { @(Get-WorkspaceRepos $root) } else { @() }
+    $text = Get-GitHookText $root
+    $manual = Get-GitHookManualLine $root
+    foreach ($r in $repos) {
+        $name = if ($r.rel) { $r.rel } else { '.' }
+        $s = Get-GitHookState $r.dir $root
+        $res = [ordered]@{ repo = $name; file = $s.file; status = $s.status; hooksPath = $s.hooksPath }
+        if ($Remove) {
+            if ($s.status -in @('installed', 'outdated')) {
+                Remove-Item -LiteralPath $s.file -Force
+                $res.status = 'removed'
+                Say "${name}：拿掉了 $($s.file)"
+            }
+        } else {
+            switch ($s.status) {
+                'installed' { Say "${name}：pre-commit 已經是這一版（$($s.file)）。" }
+                { $_ -in @('missing', 'outdated') } {
+                    [void][IO.Directory]::CreateDirectory((Split-Path $s.file -Parent))
+                    [IO.File]::WriteAllText($s.file, $text, $Utf8NoBom)
+                    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) {
+                        try { [IO.File]::SetUnixFileMode($s.file, [IO.UnixFileMode]'UserRead, UserWrite, UserExecute, GroupRead, GroupExecute, OtherRead, OtherExecute') } catch { }
+                    }
+                    Say "${name}：$(if ($s.status -eq 'outdated') { '更新了' } else { '裝好了' }) $($s.file)"
+                    $res.status = 'installed'
+                }
+                'foreign' { Warn "${name}：已經有自己的 pre-commit（$($s.file)），沒動它。在它裡面加這一行：$manual" }
+                'hooks-path' { Warn "${name}：設了 core.hooksPath（$($s.hooksPath)），git 不讀 .git/hooks，沒動它。在那裡的 pre-commit 加這一行：$manual" }
+                default { Warn "${name}：問不到 git 的 hooks 目錄，沒裝。" }
+            }
+        }
+        $results += $res
+    }
+
+    if ($Remove) {
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force; Say "拿掉了 $NoHooksMarkerRel —— orchestrator 不再自己跑 handoff-lint。" }
+    } else {
+        [void][IO.Directory]::CreateDirectory((Split-Path $marker -Parent))
+        [IO.File]::WriteAllText($marker, "這台機器的 Codex hooks 跑不起來（組織政策只允許管理員部署的 hooks）—— sdlc.ps1 git-hooks 寫的。`norchestrator 看到這個檔：每次委派前自己跑 handoff-lint -SelfCheck（AGENTS.md 的「機械強制層」）。`nCodex hooks 能跑了（管理員部署了 managed hooks）：sdlc.ps1 git-hooks -Remove。`n", $Utf8NoBom)
+    }
+    $script:Data.gitHooks = [ordered]@{ action = $(if ($Remove) { 'remove' } else { 'install' }); root = $root; marker = $NoHooksMarkerRel; markerPresent = (Test-Path -LiteralPath $marker); repos = @($results); manualLine = $manual }
+    if ($Remove) { return 0 }
+
+    if (-not $repos.Count) {
+        Warn "$(if ($haveGit) { '這裡跟底下兩層都不是 git repo' } else { '找不到 git' }) —— 沒有 pre-commit 可以裝。委派前的 handoff-lint 照樣生效（寫了 $NoHooksMarkerRel）；寫檔那三道只剩 ⑥ 的 delivery-check。"
+        $script:Data.error = 'no-git'
+        return 2
+    }
+    $done = @($results | Where-Object status -eq 'installed').Count
+    Say "寫了 $NoHooksMarkerRel —— orchestrator 每次委派前會自己跑 handoff-lint（新開的對話才讀得到 AGENTS.md 的這一條）。"
+    if ($done) {
+        Say "之後每次 commit 會跑 .codex/scripts/commit-check.ps1：殘留掃描、規範的 block 規則、build。git commit --no-verify 跳得過；要沒人跳得過，在 CI 跑：pwsh -NoProfile -File .codex/scripts/commit-check.ps1 -Base origin/main"
+    }
+    return $(if ($done -eq $repos.Count) { 0 } else { 2 })
+}
+
 $code = switch ($Command) {
     'install'      { Invoke-Install }
     'update'       { Invoke-Update }
@@ -3383,6 +3542,7 @@ $code = switch ($Command) {
     'learn'        { Invoke-Learn }
     'managed-hooks' { Invoke-ManagedHooks }
     'trust-hooks'   { Invoke-TrustHooks }
+    'git-hooks'     { Invoke-GitHooks }
 }
 
 if ($Json) {

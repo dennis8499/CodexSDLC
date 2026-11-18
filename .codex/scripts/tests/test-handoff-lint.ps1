@@ -591,3 +591,47 @@ Describe-Suite 'handoff-lint / 同一個檔的必修修了兩輪還在（review-
         } finally { Remove-Item 'bdd-docs' -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
+
+Describe-Suite 'handoff-lint / -SelfCheck（Codex hooks 跑不起來時 orchestrator 自己跑）' {
+
+    # 組織政策只允許管理員部署的 hooks、管理員又不部署時，這支一次都不會被 Codex 叫。orchestrator 照 AGENTS.md 自己把
+    # handoff 從 stdin 交進來 —— 檢查要跟 hook 一模一樣，而 hook 才做的兩件事（記帳、把修正輪那一行交給它）不能少：
+    # 少了記帳，「修了兩輪還在」永遠判不出來；少了那一行，設成 5 輪時它照預設在第 3 輪停下。
+    $ScDir = 'bdd-docs/order-cancel'
+    function Set-ScReview([string]$file) {
+        New-Item -ItemType Directory -Path $ScDir -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path (Get-Location) "$ScDir/review.md"), "VERDICT: FAIL`n`n## 發現`n1. [必修] $file`:10 —— 已出貨的沒被擋下`n", [Text.UTF8Encoding]::new($false))
+    }
+    function Invoke-ScFix([int]$round) {
+        $msg = "## meta`n- feature-id: order-cancel`n- mode: fix`n- round: $round`n- spec: bdd-docs/order-cancel/spec.md`n`n## summary`n照 review.md 的必修修。"
+        return Invoke-Script $Script -Stdin $msg -Params @{ MaxReviewRounds = 5; SelfCheck = $true }
+    }
+
+    It-Should '放行：stdout 說通過，修正輪那一行也在 stdout（沒有 hook 替它轉成 additionalContext）' {
+        try {
+            Set-ScReview 'src/A.cs'
+            $r = Invoke-ScFix 1
+            Assert-Equal 0 $r.exit "stderr: $($r.stderr)"
+            Assert-Match '通過' $r.stdout
+            Assert-Match '修正輪 1／上限 5' $r.stdout 'orchestrator 不讀設定檔，知道上限的唯一途徑就是這一行'
+            Assert-True ($r.stdout -notmatch 'hookSpecificOutput') '不是 hook 在叫，卻寫了 hook 的 JSON'
+        } finally { Remove-Item 'bdd-docs' -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '記帳：同一個檔修了兩輪還在 → 第 3 輪擋下（跟 hook 一樣）' {
+        try {
+            Set-ScReview 'src/A.cs'
+            Assert-Equal 0 (Invoke-ScFix 1).exit
+            Assert-Equal 0 (Invoke-ScFix 2).exit
+            $r = Invoke-ScFix 3
+            Assert-Equal 2 $r.exit '-SelfCheck 沒記帳 —— 沒有 hooks 的機器永遠判不出「修了兩輪還在」'
+            Assert-Match 'review-item-stuck' $r.stderr
+        } finally { Remove-Item 'bdd-docs' -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It-Should '違規照樣擋：超過上限 → exit 2' {
+        $r = Invoke-Script $Script -Stdin (Get-FixHandoff 4) -Params @{ SelfCheck = $true; MaxReviewRounds = 3 }
+        Assert-Equal 2 $r.exit
+        Assert-Match 'review-loop-exceeded' $r.stderr
+    }
+}
