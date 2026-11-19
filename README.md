@@ -1,6 +1,6 @@
 # CodexSDLC
 
-供 **Codex CLI** 使用的 SDLC 工作流：需求 → 分析 → 定案 → test-first 實作 → 獨立審核 → 交付。本 repo 僅含工作流的設定與腳本。
+Codex 的 SDLC 工作流涵蓋需求、分析、定案、test-first 實作、獨立審核與交付。可從 CLI 或 VS Code 的 Codex 使用，也可安裝選用的 VS Code 操作面板。
 
 ## 需求
 
@@ -28,7 +28,6 @@
    - `PATH` 上沒有 `codex` 時，改用 OpenAI VS Code 擴充內附的 `codex`；仍找不到時加 `-CodexPath <codex 完整路徑>`。
    - 組織政策僅允許管理員部署的 hooks（`allow_managed_hooks_only`）時不會出現此畫面：請管理員部署 `sdlc.ps1 managed-hooks -OutDir <資料夾>` 產生的腳本與 `requirements.toml` 片段。管理員不部署時，見「[組織政策不允許專案 hooks](#組織政策不允許專案-hooks)」。
 3. **檢查**：`pwsh .codex/scripts/sdlc.ps1 doctor`；確認 hooks 信任狀態加 `-CheckHookTrust`。
-4. **使用**：於專案中啟動 Codex，直接描述需求。每個需求請開新對話。
 
 ```
 <專案>/
@@ -38,7 +37,11 @@
 └── bdd-docs/                    流程產出
 ```
 
-## 流程
+## 使用
+
+於專案中啟動 Codex，直接描述需求。每個需求開一個新對話。
+
+### 流程
 
 | 步驟 | 內容 | 執行者 |
 | --- | --- | --- |
@@ -110,7 +113,7 @@ pwsh .codex/scripts/sdlc.ps1 set -Preset balanced   # fast／balanced／deep
 
 ## 團隊規範
 
-`guidelines/` 的 `*.md` 為需判斷的規範（違反 MUST 判為必修），`rules.json` 為寫檔時機械檢查的規則。寫法見 `.codex/bdd-workflow/guidelines-guide.md`。
+`guidelines/` 的 `*.md` 為需判斷的規範（違反 MUST 判為必修），`rules.json` 為寫檔時機械檢查的規則。各規範由對應角色在任務需要時讀取。見[團隊規範使用說明](.codex/bdd-workflow/guidelines-guide.md)。
 
 ## 組織政策不允許專案 hooks
 
@@ -147,8 +150,8 @@ pwsh .codex/scripts/sdlc.ps1 git-hooks
 pwsh <新版目錄>/.codex/scripts/sdlc.ps1 update -Target <專案路徑>   # -Preview 僅列出計畫
 ```
 
-- 使用者改過的工具檔先備份至 `bdd-docs/.sdlc/backup-{舊版}/`；`guidelines/` 不變動。
-- `hooks.json` 變更後須重新信任：`update` 加 `-TrustHooks`，或事後執行 `trust-hooks`。變更內容見 `sdlc.ps1 whatsnew` 或 [CHANGELOG.md](CHANGELOG.md)。
+- 使用者改過的工具檔先備份至 `bdd-docs/.sdlc/backup-{舊版}/` 再更新。團隊自訂的 `guidelines/` 會保留，舊版原廠 `guidelines/README.md` 可能換成新版索引。
+- `hooks.json` 變更後，用 `update -TrustHooks` 或事後執行 `trust-hooks` 重新信任。以 `pwsh .codex/scripts/sdlc.ps1 whatsnew` 查閱版本變更。
 - `update.source` 格式：`https://github.com/<owner>/<repo>`、`https://gitlab.com/<group>/<project>`，或 `gitea:<url>`／`gitlab:<url>`／`github:<url>`。私有 repo 的 token 置於 `CODEX_SDLC_TOKEN_<主機>`。
 
 ## 疑難排解

@@ -362,7 +362,7 @@ Describe-Suite 'gherkin-check / 不略過' {
 
     It-Should '前幾次迭代的 scenario 沒產生測試或沒通過 → 紅；標 @manual 的不要求測試' {
         # 這次只有一條；.feature 裡還有前一次交付的「已出貨的訂單不能取消」—— 改了共用的 step 讓它失去繫結時，全套照樣綠。
-        $spec = $GcSpec -replace '(?s)\n  Scenario: 已出貨的訂單不能取消.*?不能取消」\n', "`n"
+        $spec = $GcSpec -replace '(?s)(\r?\n)  Scenario: 已出貨的訂單不能取消.*?不能取消」\r?\n', '$1'
         New-GcProject -spec $spec
         $trx = Join-Path $GcRoot 'r.trx'
         try {

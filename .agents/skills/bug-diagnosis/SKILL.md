@@ -1,7 +1,7 @@
 ---
 name: bug-diagnosis
 version: 1.0.0
-description: 症狀清楚、原因不明時的除錯紀律。用於：spec.md 說這是 bug 修復、要重現一個回報的症狀、測試偶爾紅、效能問題要定位
+description: 除錯與重現。處理 spec.md 的 bug 修復、回報的症狀、偶發紅測試或效能問題時，先建可重跑的迴路再查原因。
 ---
 
 # 除錯：先建迴路，再談原因

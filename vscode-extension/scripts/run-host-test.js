@@ -2,6 +2,7 @@
 // 不碰你平常用的那一份），跑完自己關掉。
 //
 //   npm run build && npm run test:host
+//   npm run test:host -- <pack.ps1 產出的 VSIX 路徑>
 //
 // VS Code 執行檔：環境變數 VSCODE_EXECUTABLE ＞ PATH 上的 `code` 所在的安裝目錄 ＞ 下載 stable 到 .vscode-test/。
 // VSCODE_TEST_DOWNLOAD=1 強制用下載的那一份（本機的 VS Code 正在更新時會拒絕再開一個實例；下載的也比較接近乾淨環境）。
@@ -53,8 +54,20 @@ function run(cmd, args, opts = {}) {
   const extDir = path.join(tmp, 'extensions');
   fs.mkdirSync(workspace, { recursive: true });
   try {
+    const [artifact, ...extra] = process.argv.slice(2);
+    if (extra.length > 0) throw new Error('npm run test:host -- [VSIX 路徑] 最多接受一個 VSIX 路徑');
     const vsix = path.join(tmp, `codex-sdlc-${version}.vsix`);
-    run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--no-install', 'vsce', 'package', '--skip-license', '--allow-missing-repository', '--out', vsix], { cwd: ext });
+    if (artifact !== undefined) {
+      const source = path.resolve(artifact);
+      if (path.extname(source).toLowerCase() !== '.vsix' || !fs.statSync(source, { throwIfNoEntry: false })?.isFile()) {
+        throw new Error('指定的 VSIX 路徑必須指向 .vsix 檔案');
+      }
+      // 讓 VS Code CLI 一律安裝隔離目錄中的檔案，外部路徑只交給 Node 讀取。
+      fs.copyFileSync(source, vsix);
+      console.log(`[host-test] using VSIX ${source}`);
+    } else {
+      run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--no-install', 'vsce', 'package', '--skip-license', '--allow-missing-repository', '--out', vsix], { cwd: ext });
+    }
 
     const pwsh = findOnPath(process.platform === 'win32' ? ['pwsh.exe'] : ['pwsh']);
     if (!pwsh) throw new Error('需要 pwsh 7 在 PATH 上');

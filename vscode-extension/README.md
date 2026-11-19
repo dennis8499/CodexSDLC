@@ -39,6 +39,8 @@ code --uninstall-extension codex-sdlc.codex-sdlc
 
 vsix 內附同版工作流，可直接安裝至其他工作區；Cursor、Windsurf、VSCodium 通用。extension 為整台機器共用，`sdlc.ps1 update` 不會重新安裝它。
 
+在已安裝工作流的專案中，「補回工具檔」可使用同版發佈物。「升級到最新版」須取得比已安裝版本更新的發佈物，會先顯示更新預覽供確認。
+
 ## 已知限制
 
 - 僅於 Windows ＋ VS Code 實測。

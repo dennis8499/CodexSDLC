@@ -13,7 +13,7 @@
 // 裝 = 發佈物自己的 `sdlc.ps1 install`，補工具檔 = 它的 `update`。vsix 內附的那一份 payload 是
 // pack.ps1 同一次建置複製進去的，所以「兩份 payload 分岔」在構造上不會發生。
 //
-// 這支檔是唯一 import vscode 的地方。能在純 Node 底下測的邏輯都在
+// 設定樹的 VS Code 呈現在 settings-presentation。能在純 Node 底下測的邏輯都在
 // pwsh／contract／status／diagnostics／config／schema／tree／codelens。
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
@@ -62,6 +62,7 @@ const contract_1 = require("./contract");
 const diagnostics_1 = require("./diagnostics");
 const pwsh_1 = require("./pwsh");
 const schema_1 = require("./schema");
+const settings_presentation_1 = require("./settings-presentation");
 const status_1 = require("./status");
 const tree_1 = require("./tree");
 const card_1 = require("./card");
@@ -80,8 +81,6 @@ const SETTINGS_VIEW = 'codexSdlc.settings';
 const VIEW_IDS = { settings: SETTINGS_VIEW, advanced: 'codexSdlc.advanced' };
 // 按完「套用」之後「已套用」那一行停多久（從 doctor 確認完開始算）。
 const APPLIED_FLASH_MS = 2500;
-// 樹節點的假 resourceUri —— 只為了讓 FileDecoration 把要注意的那幾行的文字也上色（ThemeIcon 只染得到圖示）。
-const DECO_SCHEME = 'codex-sdlc-node';
 const WALKTHROUGH = 'codexSdlc.start';
 // vsix 內附的那一份發佈物（pack.ps1 打包時放進來的）。沒有它也能跑，安裝那條路會退回「選擇發佈物…」。
 const PAYLOAD_DIR = 'payload';
@@ -93,60 +92,6 @@ const PAYLOAD_DIR = 'payload';
 const HEARTBEAT_RECHECK_MS = 150 * 1000;
 const UPDATE_INTERVAL_MS = 60 * 60 * 1000; // 只是「問 sdlc.ps1 到期了沒」—— 真的連網與否由 update.check 決定
 const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-// 正常（ok）不上色：正常不需要被慶祝。待套用與建議用品牌強調色（package.json 的 codexSdlc.accent），不用警告色 ——
-// 那是你自己的改動，不是危險。
-const ACCENT = 'codexSdlc.accent';
-const toneColor = {
-    ok: undefined,
-    warn: 'list.warningForeground',
-    error: 'list.errorForeground',
-    pending: ACCENT,
-    muted: 'disabledForeground',
-    accent: ACCENT,
-};
-function toTreeItem(n, media) {
-    const state = n.children && n.children.length > 0
-        ? (n.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
-        : vscode.TreeItemCollapsibleState.None;
-    const item = new vscode.TreeItem(n.label, state);
-    item.id = n.id;
-    item.description = n.description;
-    item.tooltip = n.tooltip;
-    item.contextValue = n.contextValue;
-    const color = n.tone ? toneColor[n.tone] : undefined;
-    if (n.iconFile) {
-        // 異常版本兩種主題共用一張（紅色在兩邊都看得到）；其他分淺色、深色各一張。
-        item.iconPath = n.iconFile.endsWith('-error')
-            ? media(`${n.iconFile}.svg`)
-            : { light: media(`${n.iconFile}-light.svg`), dark: media(`${n.iconFile}-dark.svg`) };
-    }
-    else if (n.icon) {
-        item.iconPath = new vscode.ThemeIcon(n.icon, color ? new vscode.ThemeColor(color) : undefined);
-    }
-    if (n.command)
-        item.command = n.command;
-    if (n.tone && labelColor[n.tone]) {
-        item.resourceUri = vscode.Uri.from({ scheme: DECO_SCHEME, path: `/${n.id}`, query: n.tone });
-        // 有 resourceUri 又沒有 tooltip 時，VS Code 會把那個假路徑當 tooltip 顯示。
-        item.tooltip ??= n.label;
-    }
-    // 「未套用」在畫面上只是行尾一個 ●，螢幕閱讀器要聽得到字。
-    if (n.tone === 'pending')
-        item.accessibilityInformation = { label: `${n.label} ${n.description ?? ''} 未套用` };
-    return item;
-}
-// 只有要人注意的才連文字一起上色；ok／muted 維持一般文字。
-const labelColor = { warn: toneColor.warn, error: toneColor.error, pending: ACCENT, accent: ACCENT };
-const nodeDecorations = {
-    provideFileDecoration(uri) {
-        if (uri.scheme !== DECO_SCHEME)
-            return undefined;
-        const tone = uri.query;
-        const color = labelColor[tone];
-        // 待套用在行尾放一個 ●（跟 Git 面板的 M 同一個位置）。
-        return color ? new vscode.FileDecoration(tone === 'pending' ? '●' : undefined, tone === 'pending' ? '未套用' : undefined, new vscode.ThemeColor(color)) : undefined;
-    },
-};
 function nonce() {
     let s = '';
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -223,7 +168,7 @@ class Cockpit {
         for (const [view, id] of Object.entries(VIEW_IDS)) {
             const provider = {
                 onDidChangeTreeData: this.treeChanged.event,
-                getTreeItem: (n) => toTreeItem(n, media),
+                getTreeItem: (n) => (0, settings_presentation_1.toTreeItem)(n, media),
                 getChildren: (n) => (n ? n.children ?? [] : this.panel?.views[view] ?? []),
             };
             const tv = vscode.window.createTreeView(id, { treeDataProvider: provider, showCollapseAll: view === 'advanced' });
@@ -243,7 +188,7 @@ class Cockpit {
                 this.renderStatusCard();
             },
         }));
-        this.disposables.push(vscode.window.registerFileDecorationProvider(nodeDecorations), vscode.languages.registerCodeLensProvider({ pattern: `**/${CONFIG_REL}` }, {
+        this.disposables.push(vscode.window.registerFileDecorationProvider(settings_presentation_1.nodeDecorations), vscode.languages.registerCodeLensProvider({ pattern: `**/${CONFIG_REL}` }, {
             onDidChangeCodeLenses: this.lensChanged.event,
             provideCodeLenses: (doc) => this.codeLenses(doc),
         }));

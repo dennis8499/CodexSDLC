@@ -152,16 +152,30 @@ async function run() {
         strict_1.default.equal(d?.error, null, `set 失敗：${JSON.stringify(d)}`);
     }
     const writesMs = Date.now() - t0;
-    const pendingNode = flat(api.settingsTree()).find((n) => n.id === 'agents');
+    const pendingTree = flat(api.settingsTree());
+    const pendingNode = pendingTree.find((n) => n.id === 'agents');
     strict_1.default.equal(pendingNode.contextValue, 'tuningPending', '寫完沒標未套用 —— 面板上看不出要按套用');
     strict_1.default.match(pendingNode.description ?? '', /3 項未套用/);
+    // 從裝好的 VSIX 載入呈現程式，避免本機編譯的模組掩蓋封裝問題。
+    const { toTreeItem, nodeDecorations } = require(path.join(ext.extensionPath, 'out', 'src', 'settings-presentation.js'));
+    const media = (file) => vscode.Uri.joinPath(ext.extensionUri, 'media', 'icons', file);
+    const pendingAgent = toTreeItem(pendingTree.find((n) => n.id === 'agents/implementer'), media);
+    strict_1.default.ok(pendingAgent.resourceUri, '未套用的 agent 缺少裝飾 URI');
+    strict_1.default.equal(nodeDecorations.provideFileDecoration(pendingAgent.resourceUri)?.badge, '●');
+    strict_1.default.equal(pendingAgent.accessibilityInformation?.label, 'implementer 跟隨 · 跟隨主對話 未套用');
     await vscode.commands.executeCommand('codexSdlc.apply');
     await waitFor('套用之後調校一致', () => api.doctor()?.tuning.status === 'in-sync');
     const newFlowMs = Date.now() - t0;
     const after = api.calls();
     strict_1.default.equal((after.apply ?? 0) - (before.apply ?? 0), 1, '改三個值卻 apply 了不只一次');
     strict_1.default.equal((after.set ?? 0) - (before.set ?? 0), 3);
-    strict_1.default.equal(flat(api.settingsTree()).find((n) => n.id === 'agents').contextValue, undefined, '套用完還掛著「套用」按鈕');
+    const appliedTree = flat(api.settingsTree());
+    strict_1.default.equal(appliedTree.find((n) => n.id === 'agents').contextValue, undefined, '套用完還掛著「套用」按鈕');
+    const appliedAgent = toTreeItem(appliedTree.find((n) => n.id === 'agents/implementer'), media);
+    const appliedDecoration = appliedAgent.resourceUri ? nodeDecorations.provideFileDecoration(appliedAgent.resourceUri) : undefined;
+    strict_1.default.equal(appliedDecoration?.badge, undefined, '套用完還顯示 agent 的 ●');
+    strict_1.default.equal(appliedAgent.accessibilityInformation, undefined, '套用完還有 agent 未套用的無障礙文字');
+    log('pending agent badge and accessibility label cleared after apply');
     log(`timing: 現況（每個值 set+apply+doctor）${oldFlowMs} ms；S2（三次 set 共 ${writesMs} ms，之後一次 apply+doctor）${newFlowMs} ms`);
     const reviewerToml = fs.readFileSync(path.join(workspace, '.codex/agents/reviewer.toml'), 'utf8');
     strict_1.default.match(reviewerToml, /model_reasoning_effort = "medium"/);

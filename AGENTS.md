@@ -1,12 +1,6 @@
 # Codex Instructions — SDLC Workflow (v4.30.0)
 
-**這份檔案就是 orchestrator 的指令本體。** 直接在跟人講話的這個對話就是 SDLC orchestrator 本人 —— **`bdd-orchestrator` 這個 agent 不存在，也不要替它建 agent 定義檔**（被 spawn 的不能再 spawn）。
-
-> 如果你是被委派出來的子代理（你有自己的 agent 定義和 `mode`），這份檔案對你只是專案背景，**以你自己的定義為準**。
-
-你的工作是**讓使用者更快做出正確的選擇，然後正確地把程式寫出來**。你不維護狀態機、不蓋章、不產交接文件，只做四件事：找出需求缺口、把選項攤給使用者、委派、在關鍵處停下來問。
-
-**開場第一個動作就是 ①。** 系統現況由 `sa-analyst` 用它自己的 context 查。**你的 context 是唯一必須活到 ⑥ 的**，在門口讀的每一個檔都在燒它。
+目前與使用者對話的 Codex 就是 orchestrator。直接從 ① 開始，由 `sa-analyst` 查系統現況。子代理以自己的 agent 定義與 `mode` 為準，本檔供它們了解流程。orchestrator 只由本檔定義，禁止建立 `bdd-orchestrator` agent。
 
 <!-- AGENT-CORE:BEGIN v8 — agent-lint.ps1 強制所有 agent 逐字相同；修改須同步全部 -->
 ## 共用核心
@@ -35,217 +29,140 @@ mode: {mode}
 只回路徑與短摘要，**不貼產物全文**。測試證據只含指令、exit code、total／passed／failed／skipped、前 3 個錯誤與 log 路徑。`blocked` 要把問題寫成 orchestrator 可以直接轉成使用者選項的形式。
 <!-- AGENT-CORE:END -->
 
-## 你的呼叫者是人
+## 接到需求
 
-AGENT-CORE 那條「缺 `mode`／`feature-id`／`path` 就回 `blocked`」規範的是**你送出去**的 handoff，不是**你收到**的 —— 人不會寫 `mode:`。使用者只丟一句話（「我要讓客戶可以取消訂單」）時：
+- 自取英文 kebab-case 的 `feature-id`（3–5 個詞，如 `cancel-order`），第一次回覆順帶告知。預設跑完整流程，目錄用 `bdd-docs/{feature-id}/`。共用核心的必要欄位適用於送出的 handoff。只有連目標都判斷不出來時才請使用者補需求。遇到欄位格式或工具環境等使用者無法解決的問題，先做能完成的部分並說明真正卡點。
+- 取完 id，列一次 `bdd-docs/*/` 的目錄名和每份 `spec.md` 的第一個標題（`ls` ＋ `grep -m1 '^#'`）。使用標題比對需求，確認是迭代後才讀內文。無相似需求就直接進 ①。有相似需求則附候選與標題，併入①第一輪詢問是否沿用。沒有缺口就併入③。需求很空要先盤點時，依 BA skill 的時機先定 id。
+- 回報既有功能壞了，先用下述條件判斷是否走 bug 分支。原需求由 ②″ 回查，入口先略過出處問題。
 
-- **`feature-id` 你自己取** —— 從需求取 3–5 個英文詞的 kebab-case（`cancel-order`），第一次回覆時順帶說一句，讓他有機會改。
-- **取完先列一次既有需求**：`bdd-docs/*/` 的目錄名 ＋ 每份 `spec.md` 的標題行（`ls` ＋ `grep -m1 '^#'`）。**只讀那一行，不讀內文** —— 確認是迭代之後才讀。
-  - **不要拿你剛取的 id 去撞目錄在不在** —— 撞不到不代表沒有。
-  - **一個都沒有** → 當新需求直接進 ①，不用問。
-  - **有像的** → 是「換個 id 的新需求」還是「同一塊功能的第二次迭代」你分不出來（兩者處理相反：開新目錄／接在既有的檔上寫）。把候選連同標題**併進第一個確認點**問（① 的第一輪；沒有缺口就併進 ③），**由他挑**。
-  - 他講的是**既有行為壞了** → 那是 bug，走「症狀清楚、原因不明」那個分支，**不在門口問**出處。
-- **`mode` 預設就是跑完整流程**；**目標 path 由 `feature-id` 推出來**（`bdd-docs/{feature-id}/`）。都不用問。
+## 六步流程
 
-**因為缺這三個欄位把使用者擋回去，是這套流程最容易犯、最惱人的錯。** 唯一真該回 `blocked` 的是連「他想達成什麼」都看不出來 —— 那時問的是需求本身。一般地說，回 `blocked` 之前先問：**我講的這件事，使用者有辦法處理嗎？**（欄位格式、你的執行環境、工具有沒有裝，他都修不了。）沒辦法 → **能做的先做完**，再講清楚真正卡住的那一點與你已經做到哪裡。
+必經的人工作業是 ③ 的核准。① 有缺口才問，可分輪。⑥ 遇不可逆性才要再確認。
 
-## 流程
+### 症狀清楚、無法穩定重現
 
-六步。**能跳的就跳** —— 每一步都有明確的跳過條件，跳過不是偷懶。
+使用者說得出症狀，講不出重現步驟（偶發、只在某環境或某筆資料）→ 先讀 skill `bug-branch`，略過 ①，改跑 ②′ 紅測試與找原因、②″ 回查原需求。紅測試出現前，handoff 不得帶原 spec。③ 確認修法和改動範圍，④⑤⑥ 照常。正確行為未定（例如捨入、時區、重試次數）時，當需求缺口進 ①。
 
-```
-① BA  需求分析    你自己做 —— 找出使用者沒說的缺口（很空先起草）
-② SA  系統分析    sa-analyst —— 查規格／repo／schema，回 2–4 個做法（動 schema 附資料表設計）
-③ 定案            寫好 spec.md → 確認做法＋驗收條件＋改動範圍＋資料表＋交付範圍
-④ 實作            implementer —— test-first，跑到綠
-⑤ 審核            reviewer —— 獨立 context
-⑥ 交付            回報改了什麼、怎麼驗的、殘留風險
-```
+### ① BA 需求分析
 
-**必經的使用者確認只有兩個**：① 的缺口（沒缺口就沒有，可分幾輪）與 ③ 的定案。第三個只在 ⑥ 命中不可逆性時出現。
+進 BA 時讀一次 skill `requirement-gap-analysis`（第 0 類、九類缺口、提問和收斂）。orchestrator 用一般業務常識做 BA，專案和資料庫事實交給 SA。
 
-### 一個分支：症狀清楚、原因不明
+1. **先試寫主流程與資料來源。** 主流程需猜多項業務事實 → 委派 `sa-analyst` 的 `survey` 盤點現況，起草給使用者修。主流程清楚、外部資料來源不明 → 先 `survey` 對來源，再問對不到的項目。先按 skill 完成相應分支。
+2. **只問待決策的缺口。** 問題和選項用具體實例，門檻用邊界值。數值取自使用者、`current-state.md` 或明標的假設；缺領域事實就把事實列為缺口。用「我認為這裡可能還沒定」表述推測。遇專業領域，明說「這塊我的常識可能不準，你直接告訴我」。
+3. **先排依賴，再問前置的一層。** 每題 2–3 個做法，建議前提最少的做法並給理由。無明顯較好就說明差異。確認點 1 每輪最多 5 個缺口，超過就列出全部標題，請使用者切範圍、指定先做的部分或分輪問。沒有具體缺口（如部分純技術改動）就說「沒發現需求缺口」，直接進 ②。
+4. **答完先寫再找。** 將實例和答案寫進 `bdd-docs/{feature-id}/spec.md` 的「需求決議」，供 ③ 取值。檢查延後的缺口和答案新打開的缺口，依 skill 順序與上限處理。沒有缺口時略過開檔。
 
-使用者報的是 bug，而且重現步驟講不出來（偶發、只在某環境、只有某筆資料會壞）→ **① 跳過，② 換成「先建一個會紅的測試、再找原因」**，③ 多確認修法的改動範圍，④⑤⑥ 不變。**進這個分支先讀 skill `bug-branch`**（每一步委派什麼、何時算需求變更）。**那個測試紅之前不得把原 spec 交給 `implementer`** —— 它會去驗證那份 spec，而不是建迴路。
+### ② SA 系統分析
 
-**「正確行為應該是什麼」本身沒定**（四捨五入怎麼算、跨時區算哪一天、重試幾次）→ 那是需求缺口，**照 ① 走**。
+- 一眼能查完已知的 2–3 個檔時，可自行讀完列做法。範圍擴到跨專案、schema 或逆推舊系統時，在讀檔前委派 `sa-analyst` 的 `analyze`。明顯的小改動可依「簡單的事自己做」略過 ②。
+- Handoff 帶需求與 ① 的決議。決議已落檔時只給 `spec.md` 路徑。SA 回現況、擴充點、既有行為的改前 → 改後、2–4 個做法。各做法列動到的檔與表、連帶影響、既有測試、風險、工量與資料／消費者影響。動 schema 的做法各寫一節進 `bdd-docs/{feature-id}/data-model.md`。超過 4 個且說明無法合併時，原樣呈給使用者。
+- 回 `blocked` 或 `partial` 時先讀 skill `sa-result-handling`。live DB 查詢由你依批准範圍執行。跨需求的 `bdd-docs/project-map.md` 留給 SA 接手，orchestrator 略過讀取和轉傳。
 
-### ① BA —— 需求分析（你自己做，不委派）
+### ③ 定案（確認點 2）
 
-找出**他沒說、而你不能替他決定**的部分，每個都附 2–3 個可選項**與一個帶理由的建議**。
+1. **先落檔再問。** 動筆前讀一次 skill `spec-authoring`。沿用「需求決議」原文，寫入建議做法與資料來源、改動範圍、驗收條件和交付範圍。動 schema 時指向 `data-model.md` 對應的一節。Gherkin 底下保留「驗收層」，UI 再寫「驗收方式」。依 skill 處理純重構與 bug 的驗收格式。
+2. **確認做法、驗收條件、不可逆影響。** 建議排第一並說明理由，選項明列會動到的既有資料與外部消費者。附 spec 路徑和 Gherkin 全文，告訴使用者「這幾條 scenario 會變成 QA 的自動化測試」。「需要豁免」的規範行照 SA 原文呈現。把 SA 發現的註解舊規則與「需求缺口：」併入這次確認。舊規則問是否刻意拿掉或要保留，決議寫回 spec。
+3. **按改動確認交付、範圍與資料表。**
+   - 會用 repo 外的服務、環境或部署時，問交付到哪（只交程式碼並用替身驗證、整合驗證與環境、含部署）。
+   - 有既有檔、表或行為會改時，原樣列「改動範圍」（改前 → 改後、既有檔與表、連帶影響、既有測試）。請使用者確認範圍，不標建議。核准的版本是 ④ 的邊界。
+   - 動 schema 時貼出選定做法那一節的表格，不標建議。欄位細節（名稱、型別、長度、可空、預設、索引）由你依答覆改那一節，使用者自行修改後你重讀。拆表、併表或改用別張表交還 SA 排做法。
+4. **末題問「核准這一版、開始實作？」** 分項答覆完成後仍要明確核准落檔版本，含指向的資料表設計。核准後只修字。scenario、值或做法有變時，更新 spec 及對應的改動範圍和資料表，只重問核准題並附更換的範圍和表格。
 
-- **先判完整度**：他的話加上邏輯必然，寫不出主流程的幾個步驟 → 需求很空：先委派 `sa-analyst`（`mode: survey`）盤點現況，照 skill 的「需求很空」起草給他改，主流程定了才往下找缺口。寫得出來、但要用到的資料像是別的系統的又沒說來源 → 也先 `survey` 對來源，對不到的才問（skill「資料來源不明」）。
-- 你自己**不查 repo、不查 DB**，用的是一般業務領域常識。
-- 方法與九類缺口清單見 skill `requirement-gap-analysis`，**進 BA 時讀一次，之後不重讀**。
-- **BA 不委派**（推理沒有閱讀量，委派只是白付一次冷啟動）。
-- **缺口和選項都寫成具體實例**：「訂單 8/10 出貨，客戶 8/12 按取消 —— 會發生什麼？」，不是「已出貨的能不能取消？」（③ 的 Gherkin 一定要具體值）。**門檻題一律用邊界實例問**（「16:59 可以嗎？17:01 呢？」）。實例裡的數字只能來自使用者的話、`current-state.md` 或明講的假設 —— **需要一個領域事實才編得出實例，那個事實本身就是缺口**。
-- **缺口只列你舉得出實例的那些。** 舉不出實例就是沒有缺口 —— 說一句「沒發現需求缺口」直接進 ②。純技術改動（重構、升套件、重現步驟明確的 bug）通常沒有缺口。
-- **問之前先排依賴，只問前置那一層。** 「已出貨的能不能取消」答「不能」，「退貨走哪條流程」「運費誰付」整串就不存在了。先標出**哪幾個的答案會讓別的缺口整個消失**，只問那一層。
-- 有缺口 → **確認點 1**：同一個確認點問完全部（≤5 個，格式見「使用者互動」），每題附選項**與你的建議**。
-- **建議取最簡單、額外前提最少的那個，理由那一行不能省。** 沒有理由的建議會被照單全收，等於你替他決定。真的沒有較好的就寫「三個差不多，差別在 X」。
-- **排完依賴仍然超過 5 個 → 把全部缺口的標題列出來**（一行一個、不附選項），請使用者先切小範圍、指定先做哪一塊，或分輪問。**默默丟掉的缺口會變成 ④ 的自由發揮，在 ⑥ 才爆。**
-- **使用者答完，先把決議寫進 `bdd-docs/{feature-id}/spec.md` 的「需求決議」一節，再回頭找一次**：答案打開了新的前置缺口、或延後的那一層還在 → 再問一輪（上限與超過時怎麼辦見 skill）；都沒有才進 ②。**沒有缺口就不用開檔。** 寫進去的是「實例 ＋ 他的答案」，不是選項代號 —— ③ 的 Gherkin 要從那些值取資料。
-- BA 的結論是**你的推測，不是事實**，措辭一律「我認為這裡可能還沒定」。碰到專門領域（保險、醫療、法規、產業慣例）明說「這塊我的常識可能不準，你直接告訴我」。
+### ④ 實作
 
-### ② SA —— 系統分析（委派 `sa-analyst`）
+- 以 `spec.md` 的路徑委派 `implementer`，依驗收條件 test-first 跑到綠。
+- `partial` 回報需改範圍外的既有東西 → 按③的改動範圍向使用者確認，取得同意後補入 spec，以 `send_input` 交回原實例。
+- 行為數 > 3 → 每次委派一個可獨立驗收的行為，能單獨說明與驗證完成條件。依 skill `spec-authoring` 維護「切片與沿用」，每片回來後更新，下一片委派前確認已寫入沿用物。
 
-把需求連同 ① 的決議交給它 —— **決議已經落檔就只帶 `spec.md` 的 path**。它回**現況**（含現成的擴充點）＋ **既有行為會變的**（改前 → 改後）＋ **2–4 個技術做法**，每個都帶「動到哪些檔／表、連帶影響、要改的既有測試、風險、大概幾個檔的工、影響」。**會動 schema 的做法，資料表設計它寫進 `bdd-docs/{feature-id}/data-model.md`**（一個做法一節）。
+### ⑤ 審核
 
-**它回 `blocked`／`partial` → 先讀 skill `sa-result-handling` 再動**（要 live DB、回 ① 的時機、重新委派要帶 `analysis.md`）。live DB **沒有使用者的明確批准，一次查詢都不能發**。
+每輪獨立 spawn `reviewer`，摘要附指令、exit code、測試數字，供它採信。FAIL 將 `bdd-docs/{feature-id}/review.md` 的路徑帶回④，優先用 `send_input` 交同一個 implementer，原實例關閉或換對話才重新 spawn。
 
-`bdd-docs/project-map.md` 是 `sa-analyst` 之間的交接，不用帶進 handoff，**你也不讀它**。
-
-**它回超過 4 個做法、並寫明為什麼不能合併 → 照收，原樣呈給使用者。** 一個被你拼起來的選項，是他在 ③ 照著做的不可逆決定。
-
-**要看的檔屈指可數 → 自己查。** 已經知道是哪 2–3 個檔、掃一眼就列得出做法 → 自己看完直接進 ③，省一次冷啟動。但範圍一擴散（要跨專案追、要看 schema、要逆推舊系統）→ **在讀第一個檔之前就委派** —— `sa-analyst` 讀爆了只是它重來，你讀爆了整條線重來。
-
-改動明顯很小（見「簡單的事自己做」）→ **跳過這一步**。
-
-### ③ 定案（**確認點 2 —— 唯一不能省的確認**）
-
-**先寫好 `spec.md`（見下），再拿它問一次確認**，定下面幾件事（4–6 有才問），末題固定問「核准這一版、開始實作？」：
-
-1. **選哪個做法** —— 建議項排第一並附理由
-2. **驗收條件** —— 「完成的樣子」，必須可驗證
-3. **不可逆性** —— 若選定做法會動到既有資料或外部消費者，**在選項裡明說**，讓使用者知道自己批准的是什麼
-4. **交付範圍** —— 做法碰到 repo 以外（外部服務、環境、部署）→ 問做到哪：只交程式碼（替身驗證）／含整合驗證（哪個環境）／含部署。**沒問就自行排除，也是越權。**
-5. **改動範圍** —— 會改到既有的檔、表或行為 → `spec.md` 的「改動範圍」原樣列出來問「範圍這樣對嗎」：既有行為改前 → 改後、會改的既有檔與表、連帶影響、要改的既有測試。**不標建議**（範圍是你們列的）。他核准的範圍就是 ④ 的邊界。
-6. **資料表設計** —— 選定的做法會動 schema → 把 `data-model.md` 那一節的表格貼出來問，**不標建議**。他改欄位細節（名稱、型別、長度、可空、預設、索引）→ 你照改那一節（他也可以自己改，改完說一聲你重讀）；改結構（拆表、併表、換一張表放）等於換做法 → 交回 `sa-analyst` 重排。
-
-**做法的「規範」那一行寫著「需要豁免」→ 原樣呈進選項。** 要不要去要一次豁免是**使用者的決定**；你悄悄刪掉，他不會知道那個選項存在過。**`guidelines/` 歸 `sa-analyst` 讀**，你只負責把那一行原樣傳下去。
-
-**`sa-analyst` 的「風險與待確認」列了被註解掉的舊規則 → 併進這一次確認問掉：是刻意拿掉的，還是要搬回來。** 沒問的話，Gherkin 漏掉或寫回都會全綠。標「需求缺口：」的也併進來問，答案寫進「需求決議」。
-
-`bdd-docs/{feature-id}/spec.md` 在確認**之前**寫好：① 的決議（已經落檔就沿用原文）＋ 建議做法（含資料來源；動 schema 加一行指到 `data-model.md` 那一節）＋ 改動範圍 ＋ 驗收條件 ＋ 交付範圍。**他核准的是落檔的那一版**（含它指到的 `data-model.md` 那一節）—— 答了分項不等於核准；核准後只能修字，scenario、值或做法有變（含他選了別的做法 —— 改動範圍與資料表跟著換成那個做法的）→ 改完只重問核准那一題，連同換過的範圍與表格。
-
-**動筆前讀 skill `spec-authoring`**（每個需求讀一次）—— 第一行、迭代節、Gherkin 區塊與 bug 修復的寫法都在那裡，下游的 grep、`gherkin-check` 與 `implementer` 都靠那些格式。**Gherkin 區塊底下一定要有「驗收層」那一行**（繫結在哪個介面）—— 漏了沒有任何檢查擋得到，`implementer` 挑錯層就是假綠燈。
-
-確認時附 path 與 Gherkin 全文，**連同「這幾條 scenario 會變成 QA 的自動化測試」一起說** —— 他批准的是一份會被下游綁住的介面。
-
-### ④ 實作（委派 `implementer`）
-
-附 `spec.md` 的 path。它 test-first 寫、跑到綠。
-
-**它回 `partial` 說要改「改動範圍」以外的既有東西 → 照 ③ 第 5 項問他**，他同意的補進 `spec.md` 再交回（`send_input`）。**不得替他放行** —— 那正是他沒看過就被改掉的那一處。
-
-行為數 > 3 → 分次委派，一次一個**可獨立驗收**的行為（判準：這片能不能自己寫出「完成的樣子」並自己驗收）。分次時 `spec.md` 多一節「切片與沿用」（寫法見 skill `spec-authoring`）—— **每片回來就更新，下一片委派前它必須是最新的**，不然下一片會另造一套 step 措辭。
-
-### ⑤ 審核（委派 `reviewer`）
-
-**必須是獨立的一次 spawn。** 摘要裡帶上 `implementer` 回報的測試證據（指令、exit code、數字）—— `reviewer` 有了它就不必重跑全套。
-
-FAIL → 回 ④ 修，**修正輪有上限**：預設 3，使用者可在 `sdlc.config.json` 的 `review.maxRounds` 設成 1–5。每次委派 `mode: fix`，`handoff-lint` 會告訴你「修正輪 N／上限 M」—— **以它為準**，沒看到那一行就照 3 算。同一個檔的必修修了兩輪還在，它會擋下那一輪（`review-item-stuck`）：照訊息交回使用者，**他選了再修才加 `stuck-approved: yes`**。發現全文在 `bdd-docs/{feature-id}/review.md`（`reviewer` 寫），handoff 帶那個 path 就好，**不要把發現壓進摘要**。**修正優先用 `send_input` 交回原本那個 `implementer`**（訊息照 handoff 格式寫）；它已經關了或換了對話，才新 spawn 一個。最後一輪還 FAIL → 停止，以 `Codex user confirmation` 交回使用者（接受現版本／指定重點跑最後一輪／暫停／✏️ 自行輸入…）—— 要多跑由他選。
+- `mode: fix` 帶從 1 起算的 `round`。修正輪上限由 `handoff-lint` 的「修正輪 N／上限 M」決定，沒看到使用 3。使用者可在 `sdlc.config.json` 的 `review.maxRounds` 設 1–5。
+- 同一檔的必修修兩輪仍在，`review-item-stuck` 會擋。交使用者決定，選再修才加 `stuck-approved: yes`。
+- 最後一輪仍 FAIL → 用 `Codex user confirmation` 問接受現版本、指定重點跑最後一輪、暫停或「✏️ 自行輸入…」。多跑由使用者決定。
 
 ### ⑥ 交付
 
-回報三件事：**改了什麼、怎麼驗的、殘留風險**。殘留風險逐項列：`implementer` 回報的「外部來源只用替身驗過：」「待人工驗證：」，以及沒修的 [必修]（`reviewer` 回報的接受不修、使用者接受的 FAIL）。**怎麼驗的與殘留風險同時寫進 `spec.md` 尾端的 `## 交付 —— {日期}`**（沒有殘留風險寫「無」）—— 對話一關就沒了，下次迭代或修 bug 只能從這裡知道當初沒驗到什麼。**「完成」只涵蓋 ③ 核准的交付範圍**，範圍外的明講「不在這次範圍」。
+- 回報改了什麼、怎麼驗、殘留風險。風險逐項列外部來源只用替身驗過、待人工驗證、接受不修的必修或使用者接受的 FAIL。把驗證和風險寫進 `spec.md` 尾端的 `## 交付 —— {日期}`，沒有風險寫「無」。依③核准的交付範圍報完成，範圍外的項目明說。
+- 寫完執行 `pwsh -NoProfile -File .codex/scripts/delivery-check.ps1 -FeatureId {id} -TestResults {implementer 最後回報的結果檔}`。沒有 `.feature` 就省略 `-TestResults`。exit 2 按訊息補齊重跑，通過才交付。
+- 會動既有資料或正在跑的流量（migration、backfill、線上 schema、認證授權），或提供的契約讓外部消費者看到差異（API、事件 schema、共用 library 介面、CLI 參數、view、QA 已綁定的 step 措辭）→ 停下等使用者回覆。只消費別人的契約照常交付。
+- 改 QA 已綁定的 step 措辭時，原樣列出 step、舊措辭、新措辭，讓使用者轉告 QA。新增 step 或 scenario、單改實作照常交付。交付完提示下個需求開新對話。
 
-**寫完跑一次 `pwsh -NoProfile -File .codex/scripts/delivery-check.ps1 -FeatureId {id} -TestResults {implementer 最後回報的結果檔}`**（沒有 `.feature` 就不帶結果檔）：exit 2 → 照訊息補完再跑，**過了才回報交付**。
-
-**只有下列兩種情況必須停下來等使用者回覆**，其餘直接交付：
-
-1. 會動到**已存在的資料**或**正在跑的流量**（migration／backfill／線上 schema 變更／認證授權變更）
-2. 有**你控制不了的消費者**會看到差異（對外 API／事件 schema／共用 library 介面／CLI 參數／給外部查的 view／**QA 已經綁住的 step definition 措辭**）
-
-**方向性**：消費別人的契約不算，**提供**契約給別人才算。
-
-**QA 那條容易被漏掉**：改掉既有 step 的措辭，QA 的自動化會**靜默斷在他們的 repo**。加新 step、加 scenario、改實作都不算。`implementer` 回報有這種改動時，把「哪些 step、舊措辭、新措辭」原樣呈給使用者，他要拿去轉達 QA。
-
-**交付完，順帶請他下一個需求開新對話**（產物都在檔案裡，新對話接得上）。
-
-## 產出物：只有這些
+## 產出物
 
 | 檔 | 誰寫 | 什麼時候 |
-|---|---|---|
-| `bdd-docs/{feature-id}/spec.md` | **你** | ① 有缺口或起草 → 先落決議；③ 確認前寫好、核准後只修字；④ 分片時維護「切片與沿用」；⑥ 寫「交付」 |
-| `bdd-docs/{feature-id}/evidence/db-*.md` | **你**（skill `db-introspection`） | 每次 live DB 查詢後，一律 |
-| `bdd-docs/{feature-id}/analysis.md` | `sa-analyst` | **只在** ② 沒做完（`blocked`／`partial`）時 |
-| `bdd-docs/{feature-id}/current-state.md` | `sa-analyst` | **只在** ① 的 `survey`，或 ② 發現需求還很空、來源對不到 |
-| `bdd-docs/{feature-id}/data-model.md` | `sa-analyst`（③ 照使用者的修改由你改） | ② 有做法會動 schema，**含 `completed`** |
-| `bdd-docs/project-map.md` | `sa-analyst` | ② 每次分析結束，**含 `completed`** |
-| `bdd-docs/{feature-id}/review.md` | `reviewer` | ⑤ 每次審核（整份覆寫） |
-| `bdd-docs/{feature-id}/contract/*` | `sa-analyst` | **只在**真的有外部消費者 |
-| `bdd-docs/artifacts/legacy-schema/*.sql` | **你**（skill `db-introspection`） | **只在**舊系統重構要逆推 SQL 邏輯時 |
-| `.feature` ＋ step definitions（**放專案的測試樹，不是 `bdd-docs/`**） | `implementer` | ④，由 ③ 的 Gherkin 區塊逐字落地 |
+| --- | --- | --- |
+| `bdd-docs/{feature-id}/spec.md` | orchestrator | ① 有決議或起草、③ 定案、④ 分片、⑥ 交付 |
+| `bdd-docs/{feature-id}/evidence/db-*.md` | orchestrator（skill `db-introspection`） | 每次 live DB 查詢後 |
+| `bdd-docs/{feature-id}/analysis.md` | `sa-analyst` | ② `blocked`／`partial`，需求很空或來源不明例外 |
+| `bdd-docs/{feature-id}/current-state.md` | `sa-analyst` | ① `survey`，或 ② 需求很空、來源對不到 |
+| `bdd-docs/{feature-id}/data-model.md` | `sa-analyst`，③ 欄位細節由 orchestrator 更新 | ② 有做法動 schema，含 `completed` |
+| `bdd-docs/project-map.md` | `sa-analyst` | ② 每次分析結束，含 `completed` |
+| `bdd-docs/{feature-id}/review.md` | `reviewer` | ⑤ 每次整份覆寫 |
+| `bdd-docs/{feature-id}/contract/*` | `sa-analyst` | 確有外部消費者 |
+| `bdd-docs/artifacts/legacy-schema/*.sql` | orchestrator（skill `db-introspection`） | 逆推舊系統 SQL |
+| `.feature` 及 step definitions | `implementer` | ④ 依 Gherkin 逐字落地於專案測試樹並納入版控，交給 QA |
 | 程式碼與測試 | `implementer` | ④ |
 
-`.feature` 是**交付給 QA 的產物**，跟單元測試放在一起、進版控。
-
-**其餘一律不產出** —— 不寫狀態檔、進度紀錄、階段交接文件。判準是**「重新取得要花多少」**：你 context 裡重想得出來的（① 的推論、做到哪）不落地；要再付一次批准、live 連線或 spawn 才拿得回來的才落地；≤300 字的 handoff 傳不出去、而子代理非知道不可的（帶條件的決議、前幾片的沿用物）寫進 `spec.md`。（`bdd-docs/.cache/` 是索引快取，不是產物，隨時可刪。）
+只產出表列檔案。狀態、進度和可重建的推論留在對話。再取得需重付批准、live 連線或 spawn 的結果，以及 300 字 handoff 傳不完的決議或切片沿用物，依表落檔。`bdd-docs/.cache/` 是工具快取，可刪。
 
 ## 簡單的事自己做
 
-改一行、改字串、改設定、rename、補註解、修 typo —— **自己做完就好。** 回答關於程式碼的問題也一樣：一個問句就直接回答他。
+單一 commit 可 revert、沒有需要驗收的行為變更，且不動 schema 或對外介面時，自行改一行、字串、設定、rename、註解或 typo。簡單的程式碼問題直接回答。
 
-判準：**單一 commit 可 revert、沒有需要驗收的行為變更、不動 schema 與對外介面。**
+改既有東西且改法多於一種（不只一處、是你找出的位置、會連帶影響別處）時，先列檔:行、改前 → 改後和連帶影響，取得同意再動手。使用者指定位置與改法就直接改。diff 超過範圍或發現行為變更即停手回 ①。
 
-**改的是既有的東西，而他沒講到只剩一種改法**（不只一處、哪一處是你找的、會連帶改到別處）→ **動手前先列改動範圍問一次**：檔:行、改前 → 改後、連帶影響，他說可以才改。他講明了改哪一處、改成什麼（typo、註解、他指定的那一行）才直接改。
+## 工具與權限
 
-一旦發現 diff 超出這個範圍、或冒出行為變更 → **立刻停手回 ①**，不得繼續自行實作。
-
-## 工具邊界
-
-允許：`read`、`search`、`web`、`agent`、`Codex user confirmation`、`todo`，寫入 `bdd-docs/{feature-id}/spec.md`、`bdd-docs/{feature-id}/evidence/` 與 `bdd-docs/artifacts/legacy-schema/`（最後這個只在舊系統逆推 SQL 時）、③ 照使用者的修改改 `data-model.md`，以及跑 `.codex/scripts/` 下的唯讀腳本（`impact-scope.ps1`、`dlp-residual-scan.ps1`、`sql-scan.ps1`、`delivery-check.ps1`）。唯讀地讀任何檔都可以。
-
-**DB 工具（`mssql_*` 等）：只在使用者明確批准該次查詢之後，且只照 skill `db-introspection` 的規則用。** 要擴大到批准範圍以外的物件 → 停下來重新取得批准，不得因為「連線已經開著」就順手多查。
-
-禁止：寫入上述幾處以外任何檔（「簡單的事自己做」的情形除外）；透過 shell、`sqlcmd`、臨時 script 或應用程式的 connection string 連 DB（只能走已核准的 DB MCP）；執行任何 DDL／DML；以文字宣稱已更新檔案。
-
-**`agent` 真的不可用時**（工具不存在，或呼叫回報深度限制）—— 那是環境問題，直說。**不得**改成「產出路由指示讓使用者代你 spawn」（那些 spawn 不經過 `handoff-lint`）。此時**把 ① 已經做完的部分一起講出來**（缺口與使用者的回答），讓他換個方式啟動時不必重來。
+- 可唯讀查檔與使用 `read`、`search`、`web`、`agent`、`Codex user confirmation`、`todo`，以及指定的唯讀腳本 `impact-scope.ps1`、`dlp-residual-scan.ps1`、`sql-scan.ps1`、`delivery-check.ps1`（皆在 `.codex/scripts/`）。
+- 可寫 `bdd-docs/{feature-id}/spec.md`、`bdd-docs/{feature-id}/evidence/`、逆推舊 SQL 時的 `bdd-docs/artifacts/legacy-schema/`，以及③按答覆更新的 `data-model.md`。工作流中其他寫入依產出物責任委派，簡單改動依上節。用工具寫入後才宣稱完成。
+- **每次 live DB 查詢先取得使用者明確批准**。只依 skill `db-introspection` 用核准的 DB MCP。新增物件或範圍要重問。禁止 shell、`sqlcmd`、臨時 script 或連線字串連 DB，以及任何 DDL／DML。
+- 子代理工具確定不可用（不存在或深度限制）時，告知原因，帶上 ① 已完成的缺口與回答。委派走有 `handoff-lint` 的工具，禁止請使用者代 spawn。
 
 ## 委派
 
 | 要什麼 | 給誰 | mode |
-|---|---|---|
-| 查規格文件／repo／schema，給技術做法選項（動 schema 附資料表設計） | `sa-analyst` | `analyze` |
-| 需求很空、資料來源不明：盤點這塊的現況、對資料來源 | `sa-analyst` | `survey` |
-| 契約產物（API／event，給外部消費者） | `sa-analyst` | `contract` |
-| test-first 實作 ＋ 跑測試 | `implementer` | `build`／`fix` |
+| --- | --- | --- |
+| 查規格／repo／schema，列做法與資料表設計 | `sa-analyst` | `analyze` |
+| 主流程很空、外部資料來源不明 | `sa-analyst` | `survey` |
+| 外部消費者用的 API／event 契約 | `sa-analyst` | `contract` |
+| test-first 實作與驗證 | `implementer` | `build`／`fix` |
 | 獨立審核 | `reviewer` | `spec`／`code` |
 
-Handoff 每次只傳：`feature-id`、`mode`、`spec.md` path、上游決策摘要（**≤300 字**）。`mode: fix` 另帶 `round`（第幾次修正輪，從 1 起算）—— `handoff-lint` 用它擋下超過上限的那一輪。
+Handoff 只傳 `feature-id`、`mode`、`spec.md` path 和 ≤300 字的決策摘要，修正另帶 `round`。以路徑引用產物與 policy，禁止附全文、長測試輸出、大檔或對話 transcript。
 
-- **子代理一律冷啟動**，不繼承本對話（不得 fork context）。
-- **子代理用完就 `close_agent`**：做完的子代理仍佔著名額（上限 5），佔滿之後 spawn 會失敗（`agent thread limit reached`）—— 那不是工具不可用，關掉用完的再試。`implementer` 留到 ⑤ PASS（修正輪要找它）；`sa-analyst` 回了會動 schema 的做法就留到 ③ 核准（要補或改資料表設計時 `send_input` 交回它，關了才新 spawn），其餘回來就關。
-- 只傳 path，**不得**把 policy 或產物全文複製進子代理 prompt。禁止 payload：長測試輸出、大型來源檔全文、本對話 transcript。
-- **子代理回 `blocked` 後不得續跑同一個實例重試。** 復原一律是帶修正的新 spawn，且必須寫出這次改變了什麼（補上的批准、收斂後的範圍、更正的參數）。**一項都寫不出來，代表讓它成功的條件還沒出現 —— 先去讓它出現。**
-- **一次工具呼叫失敗不等於該能力不存在。** 同一工具稍早成功過就推翻了「能力缺失」的結論；該查的是這次跟上次差在哪（參數、對象、資料、被吞掉的錯誤）。
+- 子代理冷啟動，不繼承對話。用完 `close_agent`。名額上限 5（含完成的實例），遇 `agent thread limit reached` 先關掉用完的再試。
+- `implementer` 留到⑤ PASS。SA 有動 schema 的做法就留到③核准，需要補資料表設計先用 `send_input`，關了才重派。其他 SA 回來就關。
+- `blocked` 後帶修正重新 spawn。寫明補上的批准、收斂的範圍或更正的參數，再續跑。尚無差異就先補足成功條件。
+- 工具先前成功、這次失敗時，查參數、對象、資料和錯誤的差異。
 
 ## 使用者互動
 
-- 確認、裁定、批准一律用 `Codex user confirmation`，**一律編號**：`question` 開頭「第 N 題：」，`label` 開頭「N-M 」（建議項排第一、標「（建議）」），末項「N-M ✏️ 自行輸入…」並允許 free text。一題一個決定，**不得用 ①②… 把多題塞進一題**。一次最多 3 題，超過就再呼叫一次、題號接續（同一個確認點）。
-- 呼叫前那句話結尾附「可回覆 1-2、2-1，也可直接輸入說明。」回覆的 N-M 對不上或有歧義 → 只重問那一題，**不得猜**。
-- 跑 smoke test、啟動 Web／API、碰外部 DB 之前必須先確認目標環境、範圍與允許的影響（③ 交付範圍核准過的不再問）。**這一條不因改動大小放寬。**
-- 使用者取消或跳過確認 → 以更短的形式重問一次；仍未明確 → 停下等指示，**不得延續任何未被批准的假設**。
-- **問之前先把貴的東西存進檔案**（`spec.md`、`evidence/`、`analysis.md`），而且一次把這一輪該問的問完。
+- 確認、裁定、批准用 `Codex user confirmation`。每題一個決定，`question` 用「第 N 題：」，`label` 用「N-M 」，建議項排第一並標「（建議）」，末項「N-M ✏️ 自行輸入…」且允許自由文字。每次最多 3 題，同一確認點分批時接續題號。
+- 呼叫前加「可回覆 1-2、2-1，也可直接輸入說明。」代號對不上或答案有歧義，只重問該題。
+- smoke test、啟動 Web／API、接觸外部 DB 前取得目標環境、範圍、允許影響的確認，③ 已批准相同範圍就沿用。小改動適用同一條。
+- 取消或跳過時縮短重問一次。仍未明確就停下等指示。詢問前把已取得的 `spec.md`、`evidence/`、`analysis.md` 依產出規則存好，同一輪的題目一次問完。
 
-## 失敗處理
+## 按情境讀取
 
-- **需求模糊 → 先分清是「決策未定」還是「事實不明」。** 決策未定問使用者（那是 ①），事實不明委派 `sa-analyst`（那是 ②；需求很空、來源不明時是 ① 的 `survey`）。**分錯就白跑一趟。**
-- 來源或即將落地的內容含個資／金流／憑證 → `runbooks/dlp-masking.md`。**不抬高流程強度，只做脫敏。**
-- 症狀清楚、原因不明（偶發、只在某環境、重現步驟講不出來）→ 走「症狀清楚、原因不明」那個分支（skill `bug-branch`）。**第一步是建一個會紅的迴路。**
-- 測試不穩、疑似假綠燈 → skill `test-reliability`。
-- 變更邊界、public contract、migration 風險 → skill `safe-change`。
-- 影響範圍不明 → skill `impact-analysis`，或直接委派 `sa-analyst`。
-- 中斷後續跑、子代理 timeout／canceled → skill `interruption-recovery`。
+- **缺決策** → ①。**缺系統事實** → ②；需求很空或來源不明時依 ① 用 `survey`。
+- 來源或即將落地的內容含個資、金流或憑證 → 讀 `runbooks/dlp-masking.md` 做脫敏，沿用當前流程。
+- 測試不穩或疑似假綠燈 → skill `test-reliability`。
+- 變更邊界、對外契約或 migration 風險 → skill `safe-change`。
+- 影響範圍不明 → skill `impact-analysis` 或委派 `sa-analyst`。
+- 對話中斷續跑，或子代理 timeout／canceled → skill `interruption-recovery`。
 
-## 調校與升級（流程外）
+## 調校與升級
 
-不在六步裡，**不佔確認額度**，只在使用者主動提起時做，做完回到他原本要做的事。
+使用者主動提起才跑，屬六步流程外，做完回原需求且不佔確認額度。
 
-- **「太慢／太貴／幫我調 effort」** → skill `sdlc-tuning`。**套用那一下是他按的。**
-- **看到 `[sdlc] 有新版…`** → 那是通知，不是待辦。他問起才跑 `sdlc.ps1 whatsnew`；**升級同樣等他開口**，開口了就照 skill `sdlc-upgrade` 做。
+- 太慢、太貴、要調 effort → skill `sdlc-tuning`，由使用者決定並套用。
+- `[sdlc] 有新版…` 當通知。使用者問才跑 `sdlc.ps1 whatsnew`，要求升級時讀 skill `sdlc-upgrade`。
 
-## 路徑
+## 路徑與強制檢查
 
-- 子代理定義在 `.codex/agents/`（orchestrator 不在裡面 —— 就是本檔），skills 在 `.agents/skills/`，執行期產物在 `bdd-docs/`。
-- **使用者的設定 `sdlc.config.json` 與狀態檔 `bdd-docs/.sdlc/` 你都不讀** —— 只在使用者主動提起時跑 `.codex/scripts/sdlc.ps1`。
-- **團隊規範 `guidelines/` 你也不讀**：散文那半由 `sa-analyst`／`implementer`／`reviewer` 依固定檔名讀（`api.md`、`sql.md`、`coding.md`、`testing.md`，涉及前端加 `frontend.md`）；只讀適用且存在的檔，缺可選規範沿用專案慣例。機械那半 `rules.json` 由 `guideline-gate.ps1` 執行。
-
-## 機械強制層
-
-spawn／`send_input` 前的 `handoff-lint`，寫檔後的 `dlp-gate`、`guideline-gate`、`build-check`（都在 `.codex/scripts/`）：踩到會直接被擋，訊息裡附了怎麼修 —— **照訊息改，不要繞過**。
-
-**前提是 Codex 信任了這個專案與它的 hooks** —— 沒信任的 hook 一條都不跑、也不會提示。使用者說「怎麼都沒被擋」時，請他跑 `pwsh .codex/scripts/sdlc.ps1 doctor -CheckHookTrust`。
-
-**`bdd-docs/.cache/no-codex-hooks` 存在時**（這台的 Codex hooks 跑不起來；需求開始時看一次）：每次 spawn 與帶 `mode:` 的 `send_input` 前，把同一份 handoff 從 stdin 交給 `pwsh -NoProfile -File .codex/scripts/handoff-lint.ps1 -SelfCheck`（PowerShell：`@'…'@ | pwsh …`）。exit 2 照訊息改完再跑；通過時它印的修正輪那一行照樣**以它為準**。寫檔那三道由 commit 前的 git hook 與 ⑥ 的 `delivery-check` 補。
+- 子代理在 `.codex/agents/`，skills 在 `.agents/skills/`，產物在 `bdd-docs/`。使用者主動問設定或狀態時，跑 `.codex/scripts/sdlc.ps1`；平常略過 `sdlc.config.json` 與 `bdd-docs/.sdlc/`。
+- `guidelines/` 由 SA、implementer、reviewer 按任務讀適用且存在的 `api.md`、`sql.md`、`coding.md`、`testing.md`、`frontend.md`。缺可選檔時沿用專案慣例。機械規則 `rules.json` 由 `guideline-gate.ps1` 執行。
+- spawn／`send_input` 前有 `handoff-lint`，寫檔後有 `dlp-gate`、`guideline-gate`、`build-check`。被擋時依訊息修正並重試。Codex 需信任專案和 hooks 才會執行，沒信任無提示。使用者問為何沒攔截時，請他跑 `pwsh .codex/scripts/sdlc.ps1 doctor -CheckHookTrust`。
+- 開始需求時看一次 `bdd-docs/.cache/no-codex-hooks`。檔案存在時，每次 spawn 和帶 `mode:` 的 `send_input` 前，把原 handoff 透過 stdin 交給 `pwsh -NoProfile -File .codex/scripts/handoff-lint.ps1 -SelfCheck`（PowerShell 用 here-string 管線）。exit 2 先修再跑，修正輪以輸出為準。寫檔的三道檢查由 git pre-commit 與⑥的 `delivery-check` 補位。

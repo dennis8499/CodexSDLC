@@ -1,13 +1,12 @@
 ---
 name: api-contract-design
 version: 1.0.0
-description: 從 domain rules、examples、candidate models 產出 OpenAPI 3.1 draft 契約（P0-1 設計橋接）
+description: 外部 API 契約設計。用已定的 Gherkin、業務規則與例子寫 OpenAPI 3.1 草案，供 ATDD／TDD 與契約測試。
 ---
 
-# API Contract Design Skill
+# API 契約設計
 
-> 用途：設計橋接階段（design）產出 **draft API 契約**，供 ATDD/TDD 對齊與 P0-3 契約測試消費。
-> 產出為 draft contract，不是實作程式碼，也不是正式 API 規格審查治理產物。
+在設計階段產出供 ATDD／TDD 對齊和後續契約測試用的草案。
 
 ## 使用時機
 
@@ -38,7 +37,10 @@ description: 從 domain rules、examples、candidate models 產出 OpenAPI 3.1 d
 - `400` 語法/驗證錯誤；`401` 未認證；`403` 未授權；`404` 不存在。
 - `409` 業務/狀態衝突；`422` 語意業務驗證錯誤（若 API style 偏好）；`500` 僅限非預期伺服器錯誤。
 
-## Output Contract
+## 回傳與落檔
+
+- **單獨呼叫**：用下列回傳範本。`## design/api-contract.yaml` 是草案回傳中的標題。
+- **`sa-analyst` 的 `mode: contract`**：照角色定義寫入 `bdd-docs/{feature-id}/contract/`，並用角色的回傳合約。本 skill 提供 API 草案寫法，角色定義負責落檔和回報。
 
 ````markdown
 STATUS: needs-input | draft

@@ -35,7 +35,7 @@ mode: {mode}
 
 ## `mode: build`
 
-**驗收條件是一行 `回歸測試：…`（或 handoff 說這是建迴路）→ 這是 bug 修復，照 skill `bug-diagnosis` 做。** test-first 的順序不變，只是那個「紅」要紅在使用者報的症狀上，而且**建迴路在讀原始碼之前** —— 症狀不明時翻程式碼沒有終止條件，讀到逾時也不會有結論。**`spec.md` 還沒有「改動範圍」→ 找到原因之後、改 production code 之前停下來回 `partial`**：哪個假設成立、修法（檔:行、改前 → 改後）、連帶影響、要改的既有測試。使用者確認過，orchestrator 會把它寫進 `spec.md` 再交回給你。
+**驗收條件是 `回歸測試：…` 或 handoff 說是建迴路 → 讀 skill `bug-diagnosis`。** 先建能重現症狀的紅測試，再讀原始碼找原因。若 `spec.md` 還沒有「改動範圍」，找到原因後、改 production code 前回 `partial`，列成立的假設、修法（檔:行、改前 → 改後）、連帶影響與既有測試。等 orchestrator 將使用者核准的範圍寫入 spec 再續做。
 
 1. **讀 `spec.md` 的驗收條件**，連同「改動範圍」與它指到的 `data-model.md` 那一節。那是你的目標與邊界，不是參考資料。條件寫得不夠清楚到你沒辦法直接寫成測試 → 回 `blocked`，**補完它是 ③ 的事**。
 2. **`spec.md` 有 ` ```gherkin ` 區塊 → 先把它落成 `.feature` 檔**（見下節），再寫 step definitions，看它紅。**繫結在哪一層由那個區塊底下的「驗收層」指定**（見下面「從外往內」）。
@@ -44,17 +44,18 @@ mode: {mode}
 5. **綠了才重構。** 重構過程中測試必須一直是綠的。
 6. **交付前跑一次全套**（`commands.test`）。`failed == 0` 且 `skipped == 0`。**skipped 不是綠燈** —— 有 skip 一律寫進「風險與待確認」。全套裡有跟這次改動無關、原本就紅的測試 → 不要去修（那是範圍外），列進「風險與待確認」：哪幾個、為什麼判定無關。
 
-**3–5 的紅綠迴圈只跑這次寫的測試**：`commands.test-filter`，`{pattern}` 換成這次的測試類別或 feature（例：dotnet 的 `FullyQualifiedName~CancelOrder`、Maven 的 `CancelOrder*`）。舊專案的整套測試常要好幾分鐘，每個紅綠都跑全套是 ④ 最大的時間黑洞；全套留到第 6 步跑一次。
+### 找測試與指令
 
-**`bdd-docs/.cache/index-digest.json` 存在就先讀它**（很小）—— `commands`（build／test／test-filter 指令、step definition 與 `.feature` 的落點）與 `test-toolchain`（測試框架）都在裡面。**build／test 指令與測試落點一律從那裡取**，省掉翻目錄樹確認的那一趟。它沒有 `commands`（舊版索引）才去 `index.json` 找同名欄位 —— 那份大，別整份讀；都沒有才自己找。**改的是前端（某個 `package.json` 底下的檔）→ 用 `node-packages` 裡那個 `working-dir` 的 `commands`／`test-toolchain`，指令在那個目錄跑**；`commands` 本身帶 `working-dir` 時也一樣。
+- `bdd-docs/.cache/index-digest.json` 存在就先讀。從 `commands` 取 build／test／test-filter 指令與測試落點，從 `test-toolchain` 取框架。舊索引缺 `commands` 時只讀 `index.json` 同名欄位，都缺才自己找。改前端時用 `node-packages` 對應套件的 `commands` 與 `test-toolchain`。帶 `working-dir` 的指令在指定目錄執行。
+- 3–5 的紅綠迴圈用 `commands.test-filter`，把 `{pattern}` 換成這次的測試類別或 feature（如 `FullyQualifiedName~CancelOrder` 或 `CancelOrder*`）。第 6 步跑一次全套。
 
-**`bdd-docs/project-map.md` 存在 → 讀它的「領域詞彙」一節。** `spec.md` 裡的業務詞在那裡對得到程式已經在用的名字（型別、表、欄位）就**沿用那個名字**，也避開它標「避用」的別名。自己取一個新名字很便宜，代價是下一個人以為系統裡有兩個概念 —— 而**那件事沒有任何測試看得見**。
+**`bdd-docs/project-map.md` 存在 → 讀「領域詞彙」。** 沿用既有型別、表、欄位的名稱，避開標為「避用」的別名。涉及 `.feature` 時，也依下節讀「測試骨架」。
 
-從外往內做：先讓驗收層表達「使用者看到什麼」，再往內補單元測試。內圈的測試是為了驅動設計，不是為了覆蓋率數字。
+### 從外往內
 
-**「驗收層」是哪一層由 `spec.md` 指定，不是你挑的。** Gherkin 區塊底下那一行（HTTP endpoint／application service／domain method／UI）就是繫結點 —— 它是 ③ 跟使用者一起定的，換一層要回 `blocked` 說明理由。**那一行不存在時才自己判斷**，取**最外層仍然驗收得起來**的介面。
+先在 `spec.md` 核准的「驗收層」繫結（HTTP endpoint／application service／domain method／UI），驗使用者可觀察的行為，再往內用單元測試驅動設計。需要換層就回 `blocked` 說明。沒有「驗收層」時選最外層仍可驗收的介面。
 
-挑錯層是假綠燈最常見的來源：繫結在把被測邏輯整段 mock 掉的那一層，測試會綠、功能是壞的，而 ⑤ 的第一件事就是在查這個 —— 修它要花掉有限的修正輪（預設 3 輪）。
+驗收測試必須經過實際受測邏輯，替身放在外部依賴的邊界。
 
 ## 專案規範
 

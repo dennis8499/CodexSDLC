@@ -273,6 +273,21 @@ function Get-ContractVersion([string]$root) {
     }
 }
 
+function Write-InstalledBaseline([string]$root, [string[]]$recordSet, $sourceVersion, [switch]$adopted) {
+    $baseline = [ordered]@{}
+    foreach ($rel in $recordSet) {
+        $p = Join-Path $root $rel
+        if (Test-Path $p) { $baseline[$rel] = Get-ComparableSha $root $rel }
+    }
+    Write-JsonFile (Join-Path $root $BaselineRel) ([ordered]@{
+        # 接管要記錄建立基準線時的目標版本，前面顯示的版本可能已變更。
+        'workflow-version' = if ($adopted) { (Get-ContractVersion $root).contract } else { $sourceVersion.contract }
+        'recorded-at'      = (Get-Date).ToString('o')
+        'adopted'          = [bool]$adopted
+        'files'            = $baseline
+    })
+}
+
 # semver 比較。回 -1／0／1。
 function Compare-Semver([string]$a, [string]$b) {
     $pa = @(($a -split '\.') | ForEach-Object { [int]($_ -replace '\D', '') })
@@ -2147,20 +2162,10 @@ function Invoke-Install {
         Say "建立 $ConfigFile$(if ($Preset) { "（preset: $Preset）" } else { '（全部 inherit）' })"
     }
 
-    # 基準線：只記我們真的寫出去的檔。沒寫的（要合併的 AGENTS.md）不記 ——
+    # 首次安裝的基準線只記我們真的寫出去的檔。沒寫的（要合併的 AGENTS.md）不記 ——
     # 它沒有「原廠狀態」，記進去會讓下一次 update 把使用者的合併判成「改過」。
-    $baseline = [ordered]@{}
     $recordSet = if ($Adopt) { Get-ToolFileList $Target } else { $writes }
-    foreach ($rel in $recordSet) {
-        $p = Join-Path $Target $rel
-        if (Test-Path $p) { $baseline[$rel] = Get-ComparableSha $Target $rel }
-    }
-    Write-JsonFile (Join-Path $Target $BaselineRel) ([ordered]@{
-        'workflow-version' = if ($Adopt) { (Get-ContractVersion $Target).contract } else { $srcVer.contract }
-        'recorded-at'      = (Get-Date).ToString('o')
-        'adopted'          = [bool]$Adopt
-        'files'            = $baseline
-    })
+    Write-InstalledBaseline $Target $recordSet $srcVer -Adopted:$Adopt
 
     $code = Complete-Install $needsMerge ($HooksRel -in $writes)
     # extension 放在最後、而且在基準線寫完之後 —— 它從頭到尾都不是這個專案的檔。
@@ -2405,17 +2410,7 @@ function Invoke-Update {
     elseif ($script:Data.sourceFilled) { Say "$ConfigFile：update.source 原本是空的，補上 $($script:Data.sourceFilled) —— 從此查得到新版。" }
     elseif ($oldSrc -and -not (Get-ReleaseRepo $oldSrc)) { Warn "update.source 認不得（$oldSrc）—— 更新通知查不到。$ReleaseSourceHint：pwsh .codex/scripts/sdlc.ps1 set update.source=<網址>" }
 
-    $bl = [ordered]@{}
-    foreach ($rel in (Get-ToolFileList $Target)) {
-        $p = Join-Path $Target $rel
-        if (Test-Path $p) { $bl[$rel] = Get-ComparableSha $Target $rel }
-    }
-    Write-JsonFile (Join-Path $Target $BaselineRel) ([ordered]@{
-        'workflow-version' = $srcVer.contract
-        'recorded-at'      = (Get-Date).ToString('o')
-        'adopted'          = $false
-        'files'            = $bl
-    })
+    Write-InstalledBaseline $Target (Get-ToolFileList $Target) $srcVer
     $script:Data.result = 'applied'
 
     # 新版的 toml 是原廠檔，裡面沒有 TUNING 區塊 —— 不重跑 apply，使用者的 effort 設定就沒生效。

@@ -12,7 +12,7 @@
 // 裝 = 發佈物自己的 `sdlc.ps1 install`，補工具檔 = 它的 `update`。vsix 內附的那一份 payload 是
 // pack.ps1 同一次建置複製進去的，所以「兩份 payload 分岔」在構造上不會發生。
 //
-// 這支檔是唯一 import vscode 的地方。能在純 Node 底下測的邏輯都在
+// 設定樹的 VS Code 呈現在 settings-presentation。能在純 Node 底下測的邏輯都在
 // pwsh／contract／status／diagnostics／config／schema／tree／codelens。
 
 import * as fs from 'node:fs';
@@ -31,10 +31,11 @@ import {
   type PwshResolution, type RunResult,
 } from './pwsh';
 import { CONFIG_SCHEMA_REL, matchesPattern, readSettingsSchema, type Choice, type SettingsSchema } from './schema';
+import { nodeDecorations, toTreeItem } from './settings-presentation';
 import { statusFromDoctor, statusFromFailure, type StatusView } from './status';
 import {
   buildPanel, buildSettingsTree, pendingAgentsOf, upgradeOffer,
-  type CardAction, type EditTarget, type Panel, type SettingNode, type StatusCard, type StoredProposalItem, type Tone, type TreeInput, type ViewId,
+  type CardAction, type EditTarget, type Panel, type SettingNode, type StatusCard, type StoredProposalItem, type TreeInput, type ViewId,
 } from './tree';
 import { renderCard } from './card';
 
@@ -53,8 +54,6 @@ const SETTINGS_VIEW = 'codexSdlc.settings';
 const VIEW_IDS: Record<ViewId, string> = { settings: SETTINGS_VIEW, advanced: 'codexSdlc.advanced' };
 // 按完「套用」之後「已套用」那一行停多久（從 doctor 確認完開始算）。
 const APPLIED_FLASH_MS = 2500;
-// 樹節點的假 resourceUri —— 只為了讓 FileDecoration 把要注意的那幾行的文字也上色（ThemeIcon 只染得到圖示）。
-const DECO_SCHEME = 'codex-sdlc-node';
 const WALKTHROUGH = 'codexSdlc.start';
 // vsix 內附的那一份發佈物（pack.ps1 打包時放進來的）。沒有它也能跑，安裝那條路會退回「選擇發佈物…」。
 const PAYLOAD_DIR = 'payload';
@@ -110,60 +109,6 @@ type SdlcCall =
 
 const samePath = (a: string, b: string) =>
   process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-
-// 正常（ok）不上色：正常不需要被慶祝。待套用與建議用品牌強調色（package.json 的 codexSdlc.accent），不用警告色 ——
-// 那是你自己的改動，不是危險。
-const ACCENT = 'codexSdlc.accent';
-const toneColor: Record<Tone, string | undefined> = {
-  ok: undefined,
-  warn: 'list.warningForeground',
-  error: 'list.errorForeground',
-  pending: ACCENT,
-  muted: 'disabledForeground',
-  accent: ACCENT,
-};
-
-function toTreeItem(n: SettingNode, media: (file: string) => vscode.Uri): vscode.TreeItem {
-  const state = n.children && n.children.length > 0
-    ? (n.expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed)
-    : vscode.TreeItemCollapsibleState.None;
-  const item = new vscode.TreeItem(n.label, state);
-  item.id = n.id;
-  item.description = n.description;
-  item.tooltip = n.tooltip;
-  item.contextValue = n.contextValue;
-  const color = n.tone ? toneColor[n.tone] : undefined;
-  if (n.iconFile) {
-    // 異常版本兩種主題共用一張（紅色在兩邊都看得到）；其他分淺色、深色各一張。
-    item.iconPath = n.iconFile.endsWith('-error')
-      ? media(`${n.iconFile}.svg`)
-      : { light: media(`${n.iconFile}-light.svg`), dark: media(`${n.iconFile}-dark.svg`) };
-  } else if (n.icon) {
-    item.iconPath = new vscode.ThemeIcon(n.icon, color ? new vscode.ThemeColor(color) : undefined);
-  }
-  if (n.command) item.command = n.command;
-  if (n.tone && labelColor[n.tone]) {
-    item.resourceUri = vscode.Uri.from({ scheme: DECO_SCHEME, path: `/${n.id}`, query: n.tone });
-    // 有 resourceUri 又沒有 tooltip 時，VS Code 會把那個假路徑當 tooltip 顯示。
-    item.tooltip ??= n.label;
-  }
-  // 「未套用」在畫面上只是行尾一個 ●，螢幕閱讀器要聽得到字。
-  if (n.tone === 'pending') item.accessibilityInformation = { label: `${n.label} ${n.description ?? ''} 未套用` };
-  return item;
-}
-
-// 只有要人注意的才連文字一起上色；ok／muted 維持一般文字。
-const labelColor: Partial<Record<Tone, string>> = { warn: toneColor.warn, error: toneColor.error, pending: ACCENT, accent: ACCENT };
-
-const nodeDecorations: vscode.FileDecorationProvider = {
-  provideFileDecoration(uri) {
-    if (uri.scheme !== DECO_SCHEME) return undefined;
-    const tone = uri.query as Tone;
-    const color = labelColor[tone];
-    // 待套用在行尾放一個 ●（跟 Git 面板的 M 同一個位置）。
-    return color ? new vscode.FileDecoration(tone === 'pending' ? '●' : undefined, tone === 'pending' ? '未套用' : undefined, new vscode.ThemeColor(color)) : undefined;
-  },
-};
 
 function nonce(): string {
   let s = '';
