@@ -11,15 +11,14 @@
 #   2. 單一 operation mode（不得同時出現多個 mode 宣告）
 #   3. 必填 meta：mode、feature-id
 #   3a. 交付型 mode（build／fix／code）必須帶 spec.md 路徑 —— 沒有驗收條件就開工是最常見的返工來源
-#   3b. 修正輪（mode: fix）必須帶 round；round 超過上限即阻斷
+#   3b. 修正輪（mode: fix）須帶從 1 起算的整數 round；額外輪須符合本迭代的使用者授權
 #       上限：-MaxReviewRounds ＞ sdlc.config.json 的 review.maxRounds（1–5）＞ 預設 3
-#   3c. 同一個檔的 [必修] 修了兩輪還在 → 阻斷，交回使用者（v4.24.0；帳記在 bdd-docs/{id}/reviews/fix-rounds.json）
+#   3c. 同一個 [必修] ID 修了兩輪還在 → 交回使用者裁定
 #   4. 禁用 payload：完整 log、長測試輸出、connection string、secret、DLP mapping table
 #   5. 這次 spawn 會不會被 Codex 拒絕：effort 不在 agent 實際用的模型支援之列（v4.15.0；只判得準的才擋）
 #
-# -SelfCheck（v4.30.0）：Codex 的 hooks 跑不起來的機器（組織政策只允許管理員部署的 hooks，見 sdlc.ps1 git-hooks），
-# orchestrator 在 spawn 前把同一份 handoff 從 stdin 交給這支。檢查完全一樣；差別只有兩件 hook 在叫時才做的事：
-# 修正輪的帳照記（不然 3c 永遠判不出來），放行時要說的話（修正輪 N／上限 M、更新通知）印在 stdout。
+# -SelfCheck 預覽。無 hooks 時，實際委派前以相同 handoff 呼叫 -SelfCheck -Register。
+# 額外輪登記後，執行端以同一收據與嘗試 ID 確認送出結果。
 #
 # 自 v4.0.0 起移除：tier 相關檢查、t0 零 spawn、discover 交付型 mode、
 # 單點紀錄 mode、subagent 預算上限、successor 額度繼承。
@@ -33,9 +32,15 @@ param(
     [switch]$Managed,                                   # managed hooks（管理員部署在專案外）：沒裝工作流的專案一律放行
     [string]$Payload,
     [int]$MaxChars = 1200,
-    [int]$MaxReviewRounds = 3,                 # 明確給了就用它（測試用）；沒給就看設定檔
+    [ValidateRange(1, 5)][int]$MaxReviewRounds = 3,    # 明確給了就用它（測試用）；沒給就看設定檔
     [string]$ConfigFile = 'sdlc.config.json',
     [switch]$SelfCheck,                        # 沒有 Codex hooks 時 orchestrator 自己跑（見檔頭）
+    [switch]$Register,
+    [string]$FeatureId,
+    [string]$ReceiptId,
+    [string]$AttemptId,
+    [ValidateSet('Sent', 'NotSent')][string]$DispatchStatus,
+    [string]$DispatchEvidence,
     [switch]$Json
 )
 
@@ -78,8 +83,39 @@ function Write-HookHeartbeat([string]$eventName, [string]$name) {
     } catch { }
 }
 
+if (($Register -or $FeatureId -or $ReceiptId -or $AttemptId -or $DispatchStatus -or $DispatchEvidence) -and -not $SelfCheck) {
+    [Console]::Error.WriteLine('[handoff-lint] 正式委派及結果登記的手動入口須加 -SelfCheck。')
+    exit 2
+}
+if ($FeatureId -or $ReceiptId -or $AttemptId -or $DispatchStatus -or $DispatchEvidence) {
+    try {
+        if ($Register -or $Payload -or $ReceiptId -cnotmatch '^[0-9a-f]{32}$' -or $AttemptId -cnotmatch '^[0-9a-f]{32}$' -or
+            -not $DispatchStatus -or $DispatchEvidence -notmatch '^[A-Za-z0-9_.:/-]{1,256}$') {
+            throw '提供 -FeatureId、-ReceiptId、-AttemptId、-DispatchStatus 與原任務或事件的 -DispatchEvidence 識別碼。'
+        }
+        . (Join-Path $PSScriptRoot 'lib/fix-rounds.ps1')
+        . (Join-Path $PSScriptRoot 'lib/review-state.ps1')
+        $receipt = Set-FixDispatchStatus -WorkspaceRoot (Get-Location).Path -FeatureId $FeatureId `
+            -ReceiptId $ReceiptId -AttemptId $AttemptId -Status $DispatchStatus -Evidence $DispatchEvidence
+        if ($Json) { [pscustomobject]@{ passed = $true; receipt = $receipt } | ConvertTo-Json -Compress -Depth 4 }
+        else { Write-Output "[handoff-lint] 額外輪次收據 $($receipt.receipt_id) $($receipt.status)。" }
+        exit 0
+    } catch {
+        $problem = [pscustomobject]@{ rule = 'review-receipt-reconcile'; detail = $_.Exception.Message }
+        if ($Json) { [pscustomobject]@{ passed = $false; violations = @($problem) } | ConvertTo-Json -Compress -Depth 4 }
+        else { [Console]::Error.WriteLine("[handoff-lint] $($problem.rule)：$($problem.detail)") }
+        exit 2
+    }
+}
+
 if (-not $Payload) { $Payload = Read-StdinUtf8 }
-if (-not $Payload) { exit 0 }
+if (-not $Payload) {
+    if ($Register) {
+        [Console]::Error.WriteLine('[handoff-lint] 正式委派須提供 handoff。')
+        exit 2
+    }
+    exit 0
+}
 
 $violations = @()
 
@@ -91,9 +127,10 @@ try {
     if ($doc -is [pscustomobject] -and $doc.PSObject.Properties['hook_event_name']) { $hookEvent = [string]$doc.hook_event_name }
     if ($doc -is [pscustomobject] -and $doc.PSObject.Properties['tool_name']) { $toolName = [string]$doc.tool_name }
 } catch { }
-Write-HookHeartbeat $hookEvent 'handoff-lint'
+if (-not $SelfCheck) { Write-HookHeartbeat $hookEvent 'handoff-lint' }
 $isSendInput = $toolName -match 'send_input'
 $verb = if ($isSendInput) { 'send_input' } else { 'spawn' }
+$registerFix = [bool](($SelfCheck -and $Register) -or (-not $SelfCheck -and -not $Json -and $hookEvent -ceq 'PreToolUse'))
 
 # ---- 修正輪上限：使用者在 sdlc.config.json 的 review.maxRounds 決定 ----
 # 由這支 hook **每次現讀**，不寫進 hooks.json：hook 指令一改，Codex 會把那條 hook 標成「改過、待重審」，
@@ -234,74 +271,25 @@ if ($anchorHit.Count -gt 0 -and $prompt -notmatch '(?i)[\w.-]+/spec\.md') {
     }
 }
 
-# --- 3b. 修正輪上限 ---
-# doer↔reviewer 的 ping-pong 是沒有自然終點的迴圈。輪次由 orchestrator 自報，
-# 但機械檢查讓「超過上限的那一輪」變成一個會被擋下的事件，而不是一個沒人注意到的數字。
-# 訊息只講「停下來交回」，不講「去改設定」—— 上限歸使用者決定，要多跑一輪由他在交回時選。
+# --- 3b. 修正輪次欄位 ---
+$fixFeatureId = $null
 if ($modes -contains 'fix') {
-    $round = if ($prompt -match '(?im)^\s*[-*]?\s*round\s*:\s*(\d+)') { [int]$Matches[1] } else { $null }
-    if ($null -eq $round) {
+    . (Join-Path $PSScriptRoot 'lib/fix-rounds.ps1')
+    $roundFields = @(Get-FixField $prompt 'round')
+    $value = 0
+    if ($roundFields.Count -eq 0) {
         $violations += [pscustomobject]@{
             rule = 'missing-round'
             detail = 'mode: fix 未帶 round'
             fix = 'meta 區塊補 round（第幾次修正輪，從 1 起算）'
         }
-    } elseif ($round -gt $MaxReviewRounds) {
-        $violations += [pscustomobject]@{
-            rule = 'review-loop-exceeded'
-            detail = "round=$round > 上限 $MaxReviewRounds（$roundsSourceText）"
-            fix = '停止修正迴圈，以 Codex user confirmation 交回使用者裁定（接受現版本／指定重點跑最後一輪／暫停）'
-        }
-    }
-}
-
-# --- 3c. 同一個檔的 [必修] 修了兩輪還在 ---
-# 輪數上限數的是整個迴圈；卡住的往往是其中一項：同一個方向修第三次，多半只是再付一輪 implementer ＋ reviewer。
-# 借 archify 的修正上限（同一個問題經過兩次針對性修正還在 → 停下來回報缺口，不再盲修）：
-#   修過一次還在 → reviewer 在那一項底下寫「上一輪也是必修：…」，implementer 換做法（prompt，見兩份 agent 定義）；
-#   修過兩次還在 → 這裡擋下，交回使用者。他選「再修一輪」→ handoff 加 `stuck-approved: yes` 放行。
-# 輪次的帳：每一次放行的 mode: fix 第 N 輪，記下當時 review.md（第 N 次審核）裡有 [必修] 的檔 → reviews/fix-rounds.json。
-# round 1 重新起算（新的修正迴圈，可能是下一次迭代）。對應只看檔，跟 dlp-gate 的交代檢查同一個粒度 ——
-# 同一個檔、不同的問題也算連續（寬的那一側是多問使用者一次，不會讓卡住的那一項繼續空轉）。
-# 帳讀不到、寫不進去、或輪次跳號 → 連續就斷了，不擋（安全的一側：最多照舊跑到輪數上限）。
-$ledgerPath = $null; $ledgerData = $null
-if ($modes -contains 'fix' -and $null -ne $round -and $round -le $MaxReviewRounds) {
-    try {
-        $fid = if ($prompt -match '(?im)^\s*[-*]?\s*feature-id\s*:\s*([A-Za-z0-9][A-Za-z0-9._-]*)') { $Matches[1] } else { $null }
-        $reviewPath = if ($fid) { "bdd-docs/$fid/review.md" } else { $null }
-        if ($reviewPath -and (Test-Path -LiteralPath $reviewPath -PathType Leaf)) {
-            $reviewText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $reviewPath).Path) -replace "`r`n", "`n"
-            if ($reviewText -match '(?m)^\s*VERDICT\s*:\s*FAIL\b') {
-                # 解析格式跟 dlp-gate 的 Get-MustItems 同一條（reviewer.toml 規定的那一行）
-                $mustFiles = @([regex]::Matches($reviewText, '(?m)^\s*\d+\.\s*\[必修\]\s*(.+?)\s+——\s+') |
-                    ForEach-Object { $_.Groups[1].Value.Trim().Trim('`', '{', '}') -replace '(:\d+(-\d+)?)+$', '' } | Select-Object -Unique)
-                $ledgerPath = "bdd-docs/$fid/reviews/fix-rounds.json"
-                $rounds = @{}
-                if ($round -gt 1 -and (Test-Path -LiteralPath $ledgerPath -PathType Leaf)) {
-                    $old = Get-Content -LiteralPath $ledgerPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                    foreach ($p in $old.rounds.PSObject.Properties) { if ([int]$p.Name -lt $round) { $rounds[[int]$p.Name] = @($p.Value | ForEach-Object { [string]$_ }) } }
-                }
-                $rounds[$round] = $mustFiles
-                $stuck = @()
-                foreach ($f in $mustFiles) {
-                    $n = 0
-                    for ($k = $round; $k -ge 1 -and $rounds.ContainsKey($k) -and ($f -cin $rounds[$k]); $k--) { $n++ }
-                    if ($n -ge 3) { $stuck += "$f（第 $($round - $n + 1)–$round 次審核都有，修了 $($n - 1) 輪）" }
-                }
-                $approved = $prompt -match '(?im)^\s*[-*]?\s*stuck-approved\s*:\s*yes\b'
-                if ($stuck.Count -and -not $approved) {
-                    $violations += [pscustomobject]@{
-                        rule = 'review-item-stuck'
-                        detail = "同一個檔的 [必修] 修了兩輪還在：$($stuck -join '；')"
-                        fix = '不要再原樣交回 implementer。以 Codex user confirmation 交回使用者裁定：換做法（回 ③ 改做法或驗收條件）／接受不修（寫進交付的殘留風險）／仍要再修一輪 → 他選了再修，handoff 的 meta 加一行 stuck-approved: yes 再送'
-                    }
-                }
-                $ordered = [ordered]@{}
-                foreach ($k in ($rounds.Keys | Sort-Object)) { $ordered["$k"] = @($rounds[$k]) }
-                $ledgerData = [ordered]@{ 'feature-id' = $fid; note = 'handoff-lint 的修正輪帳：第 N 輪放行時 review.md 裡有 [必修] 的檔。可刪（刪了只是不再判「修了兩輪還在」）'; rounds = $ordered }
-            }
-        }
-    } catch { $ledgerPath = $null; $ledgerData = $null }
+    } elseif ($roundFields.Count -ne 1 -or $roundFields[0] -cnotmatch '^[0-9]+$' -or
+        -not [int]::TryParse($roundFields[0], [ref]$value) -or $value -lt 1) {
+        $violations += (New-FixProblem 'invalid-round' 'round 須為從 1 起算的整數，且只宣告一次' '填寫本次要執行的修正輪次')
+    } else { $round = $value }
+    $featureFields = @(Get-FixField $prompt 'feature-id')
+    if ($featureFields.Count -eq 1 -and $featureFields[0] -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { $fixFeatureId = $featureFields[0] }
+    elseif ($featureFields.Count) { $violations += (New-FixProblem 'invalid-feature-id' '修正輪須有一個合法的 feature-id' '引用目前需求的 feature-id') }
 }
 
 # --- 4. 禁用 payload ---
@@ -372,6 +360,30 @@ if (-not $isSendInput -and $doc -is [pscustomobject] -and $doc.PSObject.Properti
     } catch { }
 }
 
+# --- 6. 修正輪狀態。前面的檢查也通過才可登記 ---
+$receipt = $null
+if ($violations.Count -eq 0 -and $null -ne $round -and $fixFeatureId) {
+    try {
+        . (Join-Path $PSScriptRoot 'lib/review-state.ps1')
+        $workspace = (Get-Location).Path
+        $check = {
+            $result = Test-FixRoundState -WorkspaceRoot $workspace -FeatureId $fixFeatureId -Round $round -Maximum $MaxReviewRounds `
+                -MaximumSource $roundsSourceText -Prompt $prompt -Register $registerFix -HookPayload $doc
+            if ($result.legacy) {
+                $result.problem = Test-LegacyFixRound -WorkspaceRoot $workspace -FeatureId $fixFeatureId `
+                    -Round $round -Prompt $prompt -Register $registerFix
+            }
+            return $result
+        }
+        $state = if ($registerFix) { Invoke-WithReviewStateLock (Get-ReviewFeatureDir $workspace $fixFeatureId) $check }
+                 else { & $check }
+        $receipt = $state.receipt
+        if ($state.problem) { $violations += $state.problem }
+    } catch {
+        $violations += (New-FixProblem 'review-round-state-error' '無法核對或保存本次修正輪紀錄' '檢查 review 狀態與收據檔可讀寫，再以同一 handoff 重試')
+    }
+}
+
 # --- 輸出 ---
 if ($Json) {
     [pscustomobject]@{
@@ -385,6 +397,7 @@ if ($Json) {
         max_review_rounds = $MaxReviewRounds
         max_review_rounds_source = $roundsSource
         max_review_rounds_problem = $roundsProblem
+        receipt = $receipt
         violations = $violations
     } | ConvertTo-Json -Depth 4 -Compress
 }
@@ -401,14 +414,6 @@ if ($violations.Count -gt 0) {
     exit 2
 }
 
-# 修正輪的帳只在放行、而且是 hook 在叫（或 -SelfCheck）的時候記（手動跑、-Json 都不算一輪）。寫不進去就算了 —— 帳是線索，不是 gate。
-if ($ledgerPath -and $ledgerData -and ($hookEvent -or $SelfCheck) -and -not $Json) {
-    try {
-        [void][IO.Directory]::CreateDirectory((Split-Path (Join-Path (Get-Location).Path $ledgerPath) -Parent))
-        [IO.File]::WriteAllText((Join-Path (Get-Location).Path $ledgerPath), ($ledgerData | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
-    } catch { }
-}
-
 # --- 放行時要讓 orchestrator 知道的事（一個 additionalContext，不擋）---
 # 同一次輸出只能有一個 JSON 物件，所以修正輪、模型提示與更新通知收在一起、最後一次寫出。
 $contextLines = @()
@@ -421,12 +426,16 @@ if ($modelNote) {
 # 沒有這一行，設成 5 時它照 AGENTS.md 的預設在第 3 輪停下（設定靜默無效），設成 2 時它會去試第 3 輪才被擋。
 if ($modes -contains 'fix' -and $null -ne $round) {
     $line = "[handoff-lint] 修正輪 $round／上限 $MaxReviewRounds（$roundsSourceText）"
-    if ($round -ge $MaxReviewRounds) { $line += ' —— 這是最後一輪：還 FAIL 就停下，以 Codex user confirmation 交回使用者裁定。' }
+    if ($round -gt $MaxReviewRounds) { $line += ' —— 經使用者授權的額外輪次。' }
+    elseif ($round -eq $MaxReviewRounds) { $line += ' —— 正常修正的最後一輪。仍為 FAIL 時，交回使用者裁定。' }
     $contextLines += $line
     if ($roundsProblem) {
         [Console]::Error.WriteLine("[Hook][handoff-lint] $roundsProblem")
         $contextLines += "[handoff-lint] $roundsProblem"
     }
+}
+if ($receipt) {
+    $contextLines += "[handoff-lint] 額外輪次收據 $($receipt.receipt_id)，嘗試 $($receipt.attempt_id)，狀態 $($receipt.status)。"
 }
 
 # --- 更新通知（不阻斷、不碰網路）---
@@ -468,7 +477,8 @@ if ($contextLines.Count -gt 0 -and $hookEvent -and -not $Json) {
 }
 # -SelfCheck：orchestrator 讀的是這支的 stdout（沒有 hook 替它轉成 additionalContext）。
 if ($SelfCheck -and -not $hookEvent -and -not $Json) {
-    [Console]::Out.WriteLine("[handoff-lint] 通過 —— 照同一份送出。")
+    $selfCheckMessage = if ($Register) { '通過，照同一份送出。' } else { '預覽通過。實際委派前加 -Register。' }
+    [Console]::Out.WriteLine("[handoff-lint] $selfCheckMessage")
     foreach ($l in $contextLines) { [Console]::Out.WriteLine($l) }
 }
 

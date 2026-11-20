@@ -22,7 +22,6 @@ function New-ScratchAgent {
     $content = @"
 name = "$Name"
 description = "scratch"
-sandbox_mode = "danger-full-access"
 developer_instructions = '''
 # $Name
 
@@ -147,6 +146,24 @@ Describe-Suite 'agent-lint / 基準' {
             $r = Invoke-Lint
             Assert-Equal 0 $r.exit "stderr: $($r.stderr)"
         } finally { Remove-Item $Scratch -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe-Suite 'agent-lint / 角色必要欄位' {
+    foreach ($key in @('name', 'description', 'developer_instructions')) {
+        It-Should "缺 $key 的角色仍會被 agent-lint 擋下" {
+            New-CleanScratch | Out-Null
+            try {
+                $agentPath = Join-Path $Scratch 'sa-analyst.toml'
+                $body = [IO.File]::ReadAllText($agentPath) -replace "(?m)^$key\s*=.*\r?\n", ''
+                [IO.File]::WriteAllText($agentPath, $body, [Text.UTF8Encoding]::new($false))
+                $result = Invoke-Lint @{ Json = $true }
+                Assert-Equal 2 $result.exit
+                $badKey = @((($result.stdout | ConvertFrom-Json).violations) | Where-Object rule -eq 'toml-missing-key')
+                Assert-Equal 1 $badKey.Count
+                Assert-Equal "sa-analyst.toml: $key" $badKey[0].detail
+            } finally { Remove-Item -LiteralPath $Scratch -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 

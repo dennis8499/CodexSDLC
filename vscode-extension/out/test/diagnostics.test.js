@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const strict_1 = __importDefault(require("node:assert/strict"));
 const node_test_1 = require("node:test");
+const contract_1 = require("../src/contract");
 const diagnostics_1 = require("../src/diagnostics");
 (0, node_test_1.test)('guideline：block → error、warn → warning，帶規則 id 與修法', () => {
     const o = (0, diagnostics_1.guidelineOutcome)({
@@ -27,6 +28,24 @@ const diagnostics_1 = require("../src/diagnostics");
 (0, node_test_1.test)('DLP：每個類別的每一行一筆，訊息只有類別', () => {
     const o = (0, diagnostics_1.dlpOutcome)({ disabled: false, scanned: ['bdd-docs/f/notes.md'], findings: [{ file: 'bdd-docs/f/notes.md', categories: [{ type: 'email', count: 2, lines: [2, 7] }, { type: 'connstring', count: 1, lines: [9] }] }] });
     strict_1.default.deepEqual(o.records.map((r) => [r.line, r.code]), [[2, 'dlp-email'], [7, 'dlp-email'], [9, 'dlp-connstring']]);
+});
+(0, node_test_1.test)('DLP：掃描執行錯誤會提示，只更新實際掃過的檔案', () => {
+    const clean = 'bdd-docs/f/spec.md';
+    const flagged = 'bdd-docs/f/review.md';
+    const unread = 'bdd-docs/f/evidence.md';
+    const result = (0, contract_1.parseDlpGate)(JSON.stringify({
+        status: 'error',
+        passed: false,
+        disabled: false,
+        scanned: [clean, flagged],
+        findings: [{ file: flagged, categories: [{ type: 'email', count: 1, lines: [2] }] }],
+    }));
+    const outcome = (0, diagnostics_1.dlpOutcome)(result);
+    const updates = (0, diagnostics_1.groupByFile)(outcome, [clean, flagged, unread]);
+    strict_1.default.match(outcome.note ?? '', /掃描執行失敗/);
+    strict_1.default.deepEqual(updates.get(clean), []);
+    strict_1.default.equal(updates.get(flagged)?.[0].code, 'dlp-email');
+    strict_1.default.equal(updates.has(unread), false);
 });
 (0, node_test_1.test)('掃過但乾淨的檔也要出現在分組裡（才清得掉上一次的診斷）', () => {
     const o = (0, diagnostics_1.guidelineOutcome)({ status: 'scanned', files: ['src/a.sql', 'src/b.sql'], problems: [], hits: [{ rule: 'r', severity: 'warn', file: 'src/b.sql', line: 1, message: 'm', fix: '' }] });

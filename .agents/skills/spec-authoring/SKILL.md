@@ -49,6 +49,8 @@ description: ③ 定案時 orchestrator 寫 bdd-docs/{feature-id}/spec.md 的格
 
 ## ④ 分次委派時：「切片與沿用」
 
+③ 核准後依 `.codex/bdd-workflow/runbooks/review-evidence.md` 登記實作、測試與引用文件。把審查授權、風險決議、最小審核、切片與沿用及交付分別寫在各自的二級標題下。規格做法與驗收條件用核准版本的正文維護。
+
 行為數 > 3、分次委派時，`spec.md` 多一節 `## 切片與沿用`，只有兩件事：
 
 - **切法** —— 每片一行：這片是哪個行為、對應 ③ 的哪幾條 scenario。

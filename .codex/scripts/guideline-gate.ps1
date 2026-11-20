@@ -26,7 +26,7 @@
 # -Json 的 stdout 就是結果本身（VS Code extension 的 Problems 面板讀這個），**每一種情況都會輸出一個物件**，
 # 包含「沒有規則」「被關閉」這些狀態 —— 呼叫端才分得出「乾淨」與「沒有在守」。
 #
-# Exit: 0 = 無命中／只有 warn／已短路／規則檔缺失或損壞；2 = 命中 block 規則（阻斷）。
+# Exit: 0 = 通過或已短路；2 = 命中 block 規則，或 -Strict 下啟用中的檢查無法完成。
 
 [CmdletBinding()]
 param(
@@ -37,6 +37,7 @@ param(
     [string]$DisableMarker = 'guidelines/.gate-disabled',
     [int]$MaxReport        = 10,
     [switch]$Validate,                                  # 只驗規則檔本身，不掃任何檔案
+    [switch]$Strict,                                    # 交付要求完整套用已啟用的規則
     [switch]$Json
 )
 
@@ -183,11 +184,15 @@ function Get-Rules([string]$file) {
         $script:rulesDetails  += [pscustomobject]@{ index = $index; id = $(if ($id) { $id } else { $null }); field = $(if ($field) { $field } else { $null }); message = $text }
     }
     $script:rulesProblems = @(); $script:rulesDetails = @()
-    if (-not (Test-Path $file)) { return @{ rules = @(); problems = $problems; details = $details; exists = $false } }
+    if (-not (Test-Path -LiteralPath $file)) { return @{ rules = @(); problems = $problems; details = $details; exists = $false } }
 
-    try { $doc = Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json }
+    try { $doc = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json }
     catch {
         Add-Problem "$file 不是合法的 JSON：$($_.Exception.Message)" $null $null $null
+        return @{ rules = @(); problems = @($script:rulesProblems); details = @($script:rulesDetails); exists = $true }
+    }
+    if ($doc -isnot [pscustomobject] -or $doc.rules -isnot [array]) {
+        Add-Problem "$file 的 rules 必須是陣列" $null $null 'rules'
         return @{ rules = @(); problems = @($script:rulesProblems); details = @($script:rulesDetails); exists = $true }
     }
 
@@ -249,8 +254,8 @@ function Write-Result([string]$status, [string[]]$files = @(), $hits = @()) {
     if (-not $Json) { return }
     $block = @($hits | Where-Object severity -eq 'block')
     [pscustomobject]@{
-        passed        = ($block.Count -eq 0)
-        status        = $status          # disabled | no-rules | no-targets | scanned
+        passed        = ($block.Count -eq 0 -and $status -ne 'error')
+        status        = $status          # disabled | no-rules | no-targets | scanned | error
         rules_file    = $RulesFile
         problems      = @($loaded.problems)
         files         = @($files)
@@ -308,6 +313,7 @@ foreach ($p in $loaded.problems) {
     Write-Warn "規則載入失敗（該條已略過）—— $p"
     $notices += "[Hook][Guideline] 規則載入失敗（該條已略過）—— $p"
 }
+if ($Strict -and $loaded.problems.Count) { Write-Result 'error'; exit 2 }
 if ($loaded.rules.Count -eq 0) { Write-HookContext $hook.event $notices; Write-Result 'no-rules'; exit 0 }
 
 $targets = @($Path | ForEach-Object { ConvertTo-RelPath $_ } |
@@ -318,6 +324,7 @@ if (-not $targets) { Write-HookContext $hook.event $notices; Write-Result 'no-ta
 
 # ---- 掃描 ----
 $hits = @()
+$scanned = @()
 foreach ($t in $targets) {
     $applicable = @($loaded.rules | Where-Object {
         $_.globs.Count -eq 0 -or (@($_.globs | Where-Object { $t -match $_ }).Count -gt 0)
@@ -327,7 +334,14 @@ foreach ($t in $targets) {
     # `@()` 不可省：單行檔的 Get-Content 回的是**字串**而不是陣列，
     # 此時 `.Count` 仍是 1，但 `$lines[0]` 取到的是第一個**字元** —— 於是單行檔永遠掃不到東西，
     # 而且完全安靜。禁用語法寫在單行檔裡正是最常見的情況（一句 SQL、一個 config）。
-    $lines = @(Get-Content -LiteralPath $t -ErrorAction SilentlyContinue)
+    try { $lines = @(Get-Content -LiteralPath $t -ErrorAction Stop) }
+    catch {
+        if (-not $Strict) { continue }
+        Write-Warn "無法讀取 $t，規範檢查未完成。"
+        Write-Result 'error' $scanned $hits
+        exit 2
+    }
+    $scanned += $t
     if (-not $lines) { continue }
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -347,7 +361,9 @@ $blocking = @($hits | Where-Object severity -eq 'block')
 $warning  = @($hits | Where-Object severity -eq 'warn')
 
 if ($Json) {
-    Write-Result 'scanned' $targets $hits
+    if ($Strict -and -not $scanned.Count) { Write-Result 'no-targets'; exit 0 }
+    $files = if ($Strict) { $scanned } else { $targets }
+    Write-Result 'scanned' @($files) $hits
     exit $(if ($blocking.Count -gt 0) { 2 } else { 0 })
 }
 

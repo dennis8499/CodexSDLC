@@ -44,16 +44,23 @@ function dlpOutcome(r) {
             }
         }
     }
+    let note;
+    if (r.executionError)
+        note = '殘留掃描執行失敗，請檢查掃描工具後重跑。';
+    else if (r.disabled)
+        note = 'bdd-docs/.dlp-disabled 還在 —— 殘留掃描是關的。';
     return {
         scanned: r.scanned.map(norm),
         records,
-        note: r.disabled ? 'bdd-docs/.dlp-disabled 還在 —— 殘留掃描是關的。' : undefined,
+        note,
+        incomplete: r.executionError,
     };
 }
 // 把紀錄依檔分組；沒有紀錄但被掃過的檔也要出現（值是空陣列），呼叫端才會清掉它上一次的診斷。
 function groupByFile(outcome, requested) {
     const map = new Map();
-    for (const f of [...requested.map(norm), ...outcome.scanned])
+    const files = outcome.incomplete ? outcome.scanned : [...requested.map(norm), ...outcome.scanned];
+    for (const f of files)
         map.set(f, []);
     for (const r of outcome.records) {
         const list = map.get(r.file) ?? [];

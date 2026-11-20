@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { parseDlpGate } from '../src/contract';
 import { dlpOutcome, groupByFile, guidelineOutcome } from '../src/diagnostics';
 
 test('guideline：block → error、warn → warning，帶規則 id 與修法', () => {
@@ -25,6 +26,25 @@ test('guideline：被關掉時留一句話（不是某一行的事，但不能�
 test('DLP：每個類別的每一行一筆，訊息只有類別', () => {
   const o = dlpOutcome({ disabled: false, scanned: ['bdd-docs/f/notes.md'], findings: [{ file: 'bdd-docs/f/notes.md', categories: [{ type: 'email', count: 2, lines: [2, 7] }, { type: 'connstring', count: 1, lines: [9] }] }] });
   assert.deepEqual(o.records.map((r) => [r.line, r.code]), [[2, 'dlp-email'], [7, 'dlp-email'], [9, 'dlp-connstring']]);
+});
+
+test('DLP：掃描執行錯誤會提示，只更新實際掃過的檔案', () => {
+  const clean = 'bdd-docs/f/spec.md';
+  const flagged = 'bdd-docs/f/review.md';
+  const unread = 'bdd-docs/f/evidence.md';
+  const result = parseDlpGate(JSON.stringify({
+    status: 'error',
+    passed: false,
+    disabled: false,
+    scanned: [clean, flagged],
+    findings: [{ file: flagged, categories: [{ type: 'email', count: 1, lines: [2] }] }],
+  }));
+  const outcome = dlpOutcome(result);
+  const updates = groupByFile(outcome, [clean, flagged, unread]);
+  assert.match(outcome.note ?? '', /掃描執行失敗/);
+  assert.deepEqual(updates.get(clean), []);
+  assert.equal(updates.get(flagged)?.[0].code, 'dlp-email');
+  assert.equal(updates.has(unread), false);
 });
 
 test('掃過但乾淨的檔也要出現在分組裡（才清得掉上一次的診斷）', () => {

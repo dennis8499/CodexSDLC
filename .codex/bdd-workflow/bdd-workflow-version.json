@@ -1,9 +1,11 @@
 {
-    "contract-version": "4.30.0",
+    "contract-version": "4.32.0",
     "min-compatible-version": "4.2.0",
-    "deployed-at": "2026-11-18T00:00:00.000Z",
+    "deployed-at": "2026-11-20T00:00:00.000Z",
     "source": "",
     "startup-read": false,
+    "v432-fix-authorization": "修正輪由 1 起算。使用者核准後，每次迭代可針對最新 FAIL 的指定 ID 加跑一輪。實際委派前登記一筆可復原的收據，無 Codex hooks 時用 handoff-lint -SelfCheck -Register。子代理繼承父工作階段的權限。升級後由管理員更新受管 hooks。",
+    "v431-review-evidence": "交付核對實際受審的規格、契約、程式與測試版本。必修以 ID 逐項處置。仍待交付而只有舊版審查的需求，補一次程式碼審查及 ID。升級後由管理員更新受管 hooks。",
     "note": "消費端專案靠本檔判斷相容性。一致性由 .codex/scripts/agent-lint.ps1 檢查（檢查 6／7／10／11）。`startup-read` 自 4.6.0 起明確為 false —— 它以前寫 true 但**沒有任何一方在執行期讀過這個檔**，而 orchestrator 也不該讀（AGENTS.md：開場不要先勘查）。版本比對屬於 sdlc.ps1 與 handoff-lint 的快取通知，不屬於 prompt。",
     "v430-git-hooks": "**升級動作：跑 update 就好（hooks.json 沒動，不必重新信任）。組織政策只允許管理員部署的 hooks、管理員又不部署 managed-hooks 的人：升級後跑一次 sdlc.ps1 git-hooks。** 那種環境 Codex 裡一條 hook 都不會跑，以前唯一的補位是 ⑥ 的 delivery-check（而它也是 orchestrator 自己叫的）。這個政策管的是 Codex，管不到 git：(1) **新增 sdlc.ps1 git-hooks**：工作區每個 repo 裝一個 pre-commit（git 自己的 hooks 目錄，每份 clone 各一份、不進版控），commit 前跑新的 .codex/scripts/commit-check.ps1 —— staged 的 bdd-docs/ 檔跑殘留掃描、其餘跑規範的 block 規則、有 production 程式碼就 build（不去抖）。repo 已經有自己的 pre-commit 或設了 core.hooksPath 時一個字都不動，給要加的那一行；-Remove 拿掉。(2) **CI 也能跑**：commit-check -Base origin/main 查這個分支改過的檔（本機的 git commit --no-verify 跳得過，CI 跳不過）。(3) **委派前的 handoff-lint 沒有機械替代**：git-hooks 寫 bdd-docs/.cache/no-codex-hooks，AGENTS.md 叫 orchestrator 看到它就在每次委派前自己跑 handoff-lint -SelfCheck（檢查一樣、修正輪的帳照記、修正輪那一行印在 stdout）—— 這一道是榮譽制。(4) doctor 報 git-hooks 的狀態（data.gitHooks），政策只允許 managed 時指向 git-hooks。build-check 多一個 -Path；delivery-check 的殘留類別以前印成空白，修正。**沒有的**：審核紀錄「上一份的 [必修] 有沒有交代」與快照仍要 Codex hooks；回饋時間點從寫檔當下退到 commit 前。",
     "v429-ui-method": "**升級動作：跑 update 就好（hooks.json 沒動，不必重新信任）。跑到一半、驗收層是 UI 的需求：spec.md 要補一行「驗收方式」並跟使用者確認，否則 delivery-check 不放行（建議先把手上的需求跑完再升）。** UI 一定要有驗收，而且用什麼驗要在 ③ 就定下來。(1) **spec.md 新增「驗收方式」**：驗收層是 UI 時在它底下寫「驗收方式：{工具}｜{瀏覽器／project}｜{尺寸或輸入方式}｜後端：{真實／替身（依據）}」，③ 一起確認。(2) **gherkin-check 第 6 項（delivery-check 跟著擋）**：沒寫、少欄、第四欄沒講真實或替身、瀏覽器層寫了元件測試工具、Playwright 沒寫 project → 違規；Playwright 的每條 scenario 要在宣告的每一個 project 通過（JUnit 的 testsuite hostname 就是 project 名稱，1.65 實測）；Vitest 的結果要出自 Vitest 的 JUnit（根節點 vitest tests）；其他工具不擋、交給 reviewer。(3) sa-analyst 列出既有工具與 project 名稱；implementer 照驗收方式跑、做不到回 blocked；reviewer 對尺寸／輸入與後端兩欄。限制：JUnit 看不出測試有沒有真的開頁面；Vitest 改了 suiteName 會被誤判。",

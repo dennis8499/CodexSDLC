@@ -1,4 +1,4 @@
-# Codex Instructions — SDLC Workflow (v4.30.0)
+# Codex Instructions — SDLC Workflow (v4.32.0)
 
 目前與使用者對話的 Codex 就是 orchestrator。直接從 ① 開始，由 `sa-analyst` 查系統現況。子代理以自己的 agent 定義與 `mode` 為準，本檔供它們了解流程。orchestrator 只由本檔定義，禁止建立 `bdd-orchestrator` agent。
 
@@ -34,6 +34,7 @@ mode: {mode}
 - 自取英文 kebab-case 的 `feature-id`（3–5 個詞，如 `cancel-order`），第一次回覆順帶告知。預設跑完整流程，目錄用 `bdd-docs/{feature-id}/`。共用核心的必要欄位適用於送出的 handoff。只有連目標都判斷不出來時才請使用者補需求。遇到欄位格式或工具環境等使用者無法解決的問題，先做能完成的部分並說明真正卡點。
 - 取完 id，列一次 `bdd-docs/*/` 的目錄名和每份 `spec.md` 的第一個標題（`ls` ＋ `grep -m1 '^#'`）。使用標題比對需求，確認是迭代後才讀內文。無相似需求就直接進 ①。有相似需求則附候選與標題，併入①第一輪詢問是否沿用。沒有缺口就併入③。需求很空要先盤點時，依 BA skill 的時機先定 id。
 - 回報既有功能壞了，先用下述條件判斷是否走 bug 分支。原需求由 ②″ 回查，入口先略過出處問題。
+- 使用者指定由一個團隊試行風險分流時，讀 `runbooks/team-pilot.md` 選流程並記錄驗收範圍。
 
 ## 六步流程
 
@@ -66,7 +67,7 @@ mode: {mode}
    - 會用 repo 外的服務、環境或部署時，問交付到哪（只交程式碼並用替身驗證、整合驗證與環境、含部署）。
    - 有既有檔、表或行為會改時，原樣列「改動範圍」（改前 → 改後、既有檔與表、連帶影響、既有測試）。請使用者確認範圍，不標建議。核准的版本是 ④ 的邊界。
    - 動 schema 時貼出選定做法那一節的表格，不標建議。欄位細節（名稱、型別、長度、可空、預設、索引）由你依答覆改那一節，使用者自行修改後你重讀。拆表、併表或改用別張表交還 SA 排做法。
-4. **末題問「核准這一版、開始實作？」** 分項答覆完成後仍要明確核准落檔版本，含指向的資料表設計。核准後只修字。scenario、值或做法有變時，更新 spec 及對應的改動範圍和資料表，只重問核准題並附更換的範圍和表格。
+4. **末題問「核准這一版、開始實作？」** 分項答覆完成後取得落檔版本的明確核准，含指向的資料表設計。按 `runbooks/review-evidence.md` 登記已核准規格、風險、實作與測試範圍及引用契約，再交④。scenario、值或做法有變時，更新相關內容並重問核准題。
 
 ### ④ 實作
 
@@ -76,15 +77,15 @@ mode: {mode}
 
 ### ⑤ 審核
 
-每輪獨立 spawn `reviewer`，摘要附指令、exit code、測試數字，供它採信。FAIL 將 `bdd-docs/{feature-id}/review.md` 的路徑帶回④，優先用 `send_input` 交同一個 implementer，原實例關閉或換對話才重新 spawn。
+每輪先登記開始，再獨立 spawn `reviewer`，附受審範圍及測試指令、exit code、數字。收到 `bdd-docs/{feature-id}/review.md` 後登記完成並核對版本。以必修 ID 逐項對帳，修正時將報告路徑帶回④，優先 `send_input` 給同一個 implementer。命令與格式見 `runbooks/review-evidence.md`。中斷依 `interruption-recovery` 登記。
 
 - `mode: fix` 帶從 1 起算的 `round`。修正輪上限由 `handoff-lint` 的「修正輪 N／上限 M」決定，沒看到使用 3。使用者可在 `sdlc.config.json` 的 `review.maxRounds` 設 1–5。
-- 同一檔的必修修兩輪仍在，`review-item-stuck` 會擋。交使用者決定，選再修才加 `stuck-approved: yes`。
-- 最後一輪仍 FAIL → 用 `Codex user confirmation` 問接受現版本、指定重點跑最後一輪、暫停或「✏️ 自行輸入…」。多跑由使用者決定。
+- 同一必修 ID 修兩輪仍在，`review-item-stuck` 會擋。交使用者決定，選再修才加 `stuck-approved: yes`。
+- 正常輪用完且最新程式碼審查仍為 FAIL → 請使用者決定接受哪些風險、授權再修哪些問題或暫停。只在使用者明確授權後按 `runbooks/fix-rounds.md` 登記第 `M+1` 輪。
 
 ### ⑥ 交付
 
-- 回報改了什麼、怎麼驗、殘留風險。風險逐項列外部來源只用替身驗過、待人工驗證、接受不修的必修或使用者接受的 FAIL。把驗證和風險寫進 `spec.md` 尾端的 `## 交付 —— {日期}`，沒有風險寫「無」。依③核准的交付範圍報完成，範圍外的項目明說。
+- 回報改了什麼、怎麼驗、殘留風險。把驗證、待人工驗證、只驗過替身的外部來源及已接受的必修 ID 寫進 `spec.md` 尾端的 `## 交付 —— {日期}`，沒有風險寫「無」。逐項接受風險及最小審核的記法見 `runbooks/review-evidence.md`。
 - 寫完執行 `pwsh -NoProfile -File .codex/scripts/delivery-check.ps1 -FeatureId {id} -TestResults {implementer 最後回報的結果檔}`。沒有 `.feature` 就省略 `-TestResults`。exit 2 按訊息補齊重跑，通過才交付。
 - 會動既有資料或正在跑的流量（migration、backfill、線上 schema、認證授權），或提供的契約讓外部消費者看到差異（API、事件 schema、共用 library 介面、CLI 參數、view、QA 已綁定的 step 措辭）→ 停下等使用者回覆。只消費別人的契約照常交付。
 - 改 QA 已綁定的 step 措辭時，原樣列出 step、舊措辭、新措辭，讓使用者轉告 QA。新增 step 或 scenario、單改實作照常交付。交付完提示下個需求開新對話。
@@ -99,7 +100,9 @@ mode: {mode}
 | `bdd-docs/{feature-id}/current-state.md` | `sa-analyst` | ① `survey`，或 ② 需求很空、來源對不到 |
 | `bdd-docs/{feature-id}/data-model.md` | `sa-analyst`，③ 欄位細節由 orchestrator 更新 | ② 有做法動 schema，含 `completed` |
 | `bdd-docs/project-map.md` | `sa-analyst` | ② 每次分析結束，含 `completed` |
-| `bdd-docs/{feature-id}/review.md` | `reviewer` | ⑤ 每次整份覆寫 |
+| `bdd-docs/{feature-id}/spec-review.md` | `reviewer` | 草案的規格就緒審查 |
+| `bdd-docs/{feature-id}/review.md` | `reviewer` | ⑤ 當輪程式碼審查，含上一輪必修處置 |
+| `bdd-docs/{feature-id}/reviews/` | 審查及修正輪腳本 | 核准、審查及委派的最小紀錄 |
 | `bdd-docs/{feature-id}/contract/*` | `sa-analyst` | 確有外部消費者 |
 | `bdd-docs/artifacts/legacy-schema/*.sql` | orchestrator（skill `db-introspection`） | 逆推舊系統 SQL |
 | `.feature` 及 step definitions | `implementer` | ④ 依 Gherkin 逐字落地於專案測試樹並納入版控，交給 QA |
@@ -115,7 +118,9 @@ mode: {mode}
 
 ## 工具與權限
 
+- Codex 角色繼承父工作階段的沙箱與核准設定。唯讀用於盤點及檢查，寫入流程在已授權可寫的工作區執行。
 - 可唯讀查檔與使用 `read`、`search`、`web`、`agent`、`Codex user confirmation`、`todo`，以及指定的唯讀腳本 `impact-scope.ps1`、`dlp-residual-scan.ps1`、`sql-scan.ps1`、`delivery-check.ps1`（皆在 `.codex/scripts/`）。
+- 可依審查與修正輪指引執行 `review-check.ps1`、`handoff-lint.ps1` 寫必要紀錄。
 - 可寫 `bdd-docs/{feature-id}/spec.md`、`bdd-docs/{feature-id}/evidence/`、逆推舊 SQL 時的 `bdd-docs/artifacts/legacy-schema/`，以及③按答覆更新的 `data-model.md`。工作流中其他寫入依產出物責任委派，簡單改動依上節。用工具寫入後才宣稱完成。
 - **每次 live DB 查詢先取得使用者明確批准**。只依 skill `db-introspection` 用核准的 DB MCP。新增物件或範圍要重問。禁止 shell、`sqlcmd`、臨時 script 或連線字串連 DB，以及任何 DDL／DML。
 - 子代理工具確定不可用（不存在或深度限制）時，告知原因，帶上 ① 已完成的缺口與回答。委派走有 `handoff-lint` 的工具，禁止請使用者代 spawn。
@@ -130,7 +135,7 @@ mode: {mode}
 | test-first 實作與驗證 | `implementer` | `build`／`fix` |
 | 獨立審核 | `reviewer` | `spec`／`code` |
 
-Handoff 只傳 `feature-id`、`mode`、`spec.md` path 和 ≤300 字的決策摘要，修正另帶 `round`。以路徑引用產物與 policy，禁止附全文、長測試輸出、大檔或對話 transcript。
+Handoff 傳 `feature-id`、`mode`、`spec.md` path 和 ≤300 字的決策摘要。審查附本次 `review_id`，修正附 `round`，額外輪附 `issue-ids`。以路徑引用產物與 policy，禁止附全文、長測試輸出、大檔或對話 transcript。
 
 - 子代理冷啟動，不繼承對話。用完 `close_agent`。名額上限 5（含完成的實例），遇 `agent thread limit reached` 先關掉用完的再試。
 - `implementer` 留到⑤ PASS。SA 有動 schema 的做法就留到③核准，需要補資料表設計先用 `send_input`，關了才重派。其他 SA 回來就關。
@@ -165,4 +170,4 @@ Handoff 只傳 `feature-id`、`mode`、`spec.md` path 和 ≤300 字的決策摘
 - 子代理在 `.codex/agents/`，skills 在 `.agents/skills/`，產物在 `bdd-docs/`。使用者主動問設定或狀態時，跑 `.codex/scripts/sdlc.ps1`；平常略過 `sdlc.config.json` 與 `bdd-docs/.sdlc/`。
 - `guidelines/` 由 SA、implementer、reviewer 按任務讀適用且存在的 `api.md`、`sql.md`、`coding.md`、`testing.md`、`frontend.md`。缺可選檔時沿用專案慣例。機械規則 `rules.json` 由 `guideline-gate.ps1` 執行。
 - spawn／`send_input` 前有 `handoff-lint`，寫檔後有 `dlp-gate`、`guideline-gate`、`build-check`。被擋時依訊息修正並重試。Codex 需信任專案和 hooks 才會執行，沒信任無提示。使用者問為何沒攔截時，請他跑 `pwsh .codex/scripts/sdlc.ps1 doctor -CheckHookTrust`。
-- 開始需求時看一次 `bdd-docs/.cache/no-codex-hooks`。檔案存在時，每次 spawn 和帶 `mode:` 的 `send_input` 前，把原 handoff 透過 stdin 交給 `pwsh -NoProfile -File .codex/scripts/handoff-lint.ps1 -SelfCheck`（PowerShell 用 here-string 管線）。exit 2 先修再跑，修正輪以輸出為準。寫檔的三道檢查由 git pre-commit 與⑥的 `delivery-check` 補位。
+- 開始需求時看一次 `bdd-docs/.cache/no-codex-hooks`。檔案存在時，每次 spawn 和帶 `mode:` 的 `send_input` 前，把原 handoff 透過 stdin 交給 `handoff-lint.ps1 -SelfCheck`。修正輪正式送出前加 `-Register` 登記，同一次委派依 `runbooks/fix-rounds.md` 回填執行結果。exit 2 先修再跑。寫檔檢查由 git pre-commit 與⑥的 `delivery-check` 補位。

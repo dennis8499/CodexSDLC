@@ -58,9 +58,9 @@ user-invocable: false
 
 ## Reviewer 中斷
 
-第一次中斷後重呼叫時縮小 prompt：只給檔案路徑、審核焦點最多 3 項、要求 `VERDICT` 第一行輸出。
+程式碼審查中斷、取消或未完成時，依 `.codex/bdd-workflow/runbooks/review-evidence.md` 用原 `review_id` 登記 `Complete -Incomplete`。第一次重試先新登記，handoff 給檔案路徑、審核焦點最多 3 項及新 ID。
 
-第二次仍中斷 → orchestrator 自己做一次最小審核（只看「測試有沒有真的測到東西」），降級 PASS 前必須以 `Codex user confirmation` 取得使用者同意。這時 `bdd-docs/{feature-id}/review.md` 還是上一次 reviewer 寫的：最小審核查出要修的東西，修正 handoff 要寫明「review.md 是舊的，以摘要為準」，否則 `implementer` 會照舊的發現修。
+同一受審版本連續兩次未完成時，一般需求可依審查指引做最小審核。先檢查測試是否驗到驗收條件，處置已知必修，再請使用者同意此例外。高風險需求續接獨立審查。完成且判為 FAIL 的審查交回逐項處置。
 
 ## 子代理回 `partial`
 
@@ -71,14 +71,15 @@ user-invocable: false
 
 ## 中斷後續跑
 
-這套流程是無狀態的，所以續跑不靠狀態檔，靠這幾樣，依序：
+先讀需求與既有證據，再核對正式收據。
 
 1. **`bdd-docs/{feature-id}/spec.md`** —— 需求與驗收條件都在裡面，這是唯一必須存在的東西。
 2. **`bdd-docs/{feature-id}/evidence/`** —— DB 盤點結果。**有這個就絕對不要重查 DB**：那要再花一次使用者批准、一次連線、一次等待，而答案已經在檔案裡了。
 3. **`bdd-docs/{feature-id}/analysis.md`** —— `sa-analyst` 上次沒做完時留下的現況與做法。**有這個就從它接續，不要叫 SA 從頭重讀 repo** —— 那是逾時最常發生的地方。
 4. **`bdd-docs/{feature-id}/current-state.md`** —— 需求很空、或資料來源不明時 `survey` 盤點的現況（後者多一節「資料來源」）。**有這個就不要再 `survey`**，拿它接著起草或問來源；`spec.md`「需求決議」裡已經談定的步驟不要重問。
 5. **`bdd-docs/{feature-id}/data-model.md`** —— ② 寫的資料表設計。`spec.md` 已經指到的那一節是核准過的，照它做；還沒被指到（③ 之前中斷）→ 重新委派 `analyze` 時它會先讀、沿用，不重新設計。
-6. **實際的程式碼與測試** —— 跑一次測試就知道做到哪了。
-7. 使用者。
+6. **`bdd-docs/{feature-id}/reviews/`** —— 查已登記的核准、審查與委派收據。收到修正輪收據後中斷時，依 `.codex/bdd-workflow/runbooks/fix-rounds.md` 查原任務的送出狀態。
+7. **實際的程式碼與測試** —— 比對已完成的範圍及測試結果。
+8. 使用者。
 
 **`spec.md` 不在就從 ① 重跑。** BA 是純推理，幾乎免費；只有 SA 的靜態分析要重付一次 spawn（evidence 還在的話，DB 那段不用重付；`current-state.md` 還在的話，`survey` 也不用重跑）。不要為了省那一次而猜使用者原本決定了什麼。

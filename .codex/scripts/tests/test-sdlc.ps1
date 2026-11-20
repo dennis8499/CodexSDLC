@@ -213,6 +213,29 @@ Describe-Suite 'sdlc / 安裝' {
 
 Describe-Suite 'sdlc / 升級' {
 
+    It-Should '只設定 review 和 update 的既有專案可升級，保留自訂值並補預設角色' {
+        $r1 = New-SdlcRelease 'r1-partial-config'
+        $target = New-SdlcTarget 't-partial-config'
+        try {
+            Invoke-Sdlc install @{ Source = $r1; Target = $target } | Out-Null
+            $configPath = Join-Path $target 'sdlc.config.json'
+            New-SdlcFile $configPath '{"review":{"maxRounds":5},"update":{"check":"never"}}'
+            $r2 = New-SdlcRelease 'r2-partial-config' -Version '4.7.0'
+            $result = Invoke-Sdlc update @{ Source = $r2; Target = $target; Yes = $true }
+            Assert-Equal 0 $result.exit $result.stderr
+            $config = (Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json)
+            Assert-Equal 5 $config.review.maxRounds
+            Assert-Equal 'never' $config.update.check
+            Assert-Equal '4.7.0' $config.'workflow-version'
+            Assert-Equal 'inherit' $config.agents.'sa-analyst'.effort
+        } finally {
+            $knownRoot = [IO.Path]::GetFullPath($SdlcRoot)
+            if ((Split-Path $knownRoot -Parent) -eq [IO.Path]::GetTempPath().TrimEnd('\', '/')) {
+                Remove-Item -LiteralPath $knownRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     It-Should '使用者改過的工具檔會被備份，不是靜默覆蓋' {
         $r1 = New-SdlcRelease 'r1-mod' -Extra @('.codex/scripts/impact-scope.ps1')
         $t = New-SdlcTarget 't-mod'
@@ -2052,6 +2075,25 @@ Describe-Suite 'sdlc / 修正輪上限（review.maxRounds）' {
     }
 }
 
+Describe-Suite 'sdlc / 舊角色 sandbox_mode 說明' {
+    It-Should 'doctor 指出舊欄位與父工作階段權限，並允許原有專案沿用' {
+        $release = New-SdlcRelease 'role-sandbox-release' -WithHooks
+        $target = New-SdlcTarget 'role-sandbox-target'
+        try {
+            Invoke-Sdlc install @{ Source = $release; Target = $target } | Out-Null
+            $legacy = Invoke-SdlcJson doctor (Get-IsolatedDoctorParams $target)
+            Assert-Equal 'sa-analyst.toml' (@($legacy.data.legacyAgentSandbox) -join ',')
+            Assert-Match 'sandbox_mode.*繼承父工作階段' (@($legacy.warnings) -join ' ')
+            $path = Join-Path $target '.codex/agents/sa-analyst.toml'
+            $text = [IO.File]::ReadAllText($path) -replace '(?m)^sandbox_mode.*\r?\n', ''
+            [IO.File]::WriteAllText($path, $text, $Utf8)
+            $current = Invoke-SdlcJson doctor (Get-IsolatedDoctorParams $target)
+            Assert-Equal 0 @($current.data.legacyAgentSandbox).Count
+            Assert-Equal $current.data.problems $legacy.data.problems '舊欄位的提示不應計為專案錯誤'
+        } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Describe-Suite 'sdlc / 叫起另一支 pwsh（doctor 的 agent-lint、tune 的 repo-index 都靠它）' {
 
     # pwsh 以 .NET global tool 安裝時，[Environment]::ProcessPath 是 dotnet.exe。拿它當 pwsh 叫，
@@ -2833,7 +2875,7 @@ Describe-Suite 'sdlc managed-hooks / 給管理員的部署包' {
             $j = Invoke-SdlcJson 'managed-hooks' @{ OutDir = $out; ManagedDir = 'D:\corp\hooks'; UnixManagedDir = '/opt/corp/hooks' }
             Assert-Equal 0 $j.exit "warnings: $($j.warnings -join ' | ')"
             $pkg = Join-Path $out 'codex-sdlc'
-            foreach ($f in 'handoff-lint.ps1', 'dlp-gate.ps1', 'guideline-gate.ps1', 'build-check.ps1', 'dlp-residual-scan.ps1', 'lib/node-project.ps1', 'lib/workspace-repos.ps1') {
+            foreach ($f in 'handoff-lint.ps1', 'dlp-gate.ps1', 'guideline-gate.ps1', 'build-check.ps1', 'dlp-residual-scan.ps1', 'lib/node-project.ps1', 'lib/workspace-repos.ps1', 'lib/review-state.ps1', 'lib/fix-rounds.ps1') {
                 Assert-True (Test-Path (Join-Path $pkg $f)) "部署包少了 $f"
             }
             $ver = (Get-Content '.codex/bdd-workflow/bdd-workflow-version.json' -Raw | ConvertFrom-Json).'contract-version'
@@ -2856,7 +2898,9 @@ Describe-Suite 'sdlc managed-hooks / 給管理員的部署包' {
             Assert-Equal 0 $j.exit
             $toml = [IO.File]::ReadAllText((Join-Path $out 'requirements-hooks.toml'))
             $cmd = [regex]::Match($toml, "(?m)^command_windows = '''(.*dlp-gate\.ps1.*)'''$").Groups[1].Value
+            $handoffCmd = [regex]::Match($toml, "(?m)^command_windows = '''(.*handoff-lint\.ps1.*)'''$").Groups[1].Value
             Assert-True ([bool]$cmd) '片段裡找不到 dlp-gate 的指令'
+            Assert-True ([bool]$handoffCmd) '片段裡找不到 handoff-lint 的指令'
             $proj = Join-Path $SdlcRoot 'proj'; $other = Join-Path $SdlcRoot 'other'
             foreach ($d in $proj, $other) { New-SdlcFile (Join-Path $d 'bdd-docs/f/spec.md') "連線：Server=db01;Initial Catalog=Orders;User Id=sa;`n" }
             New-SdlcFile (Join-Path $proj '.codex/bdd-workflow/bdd-workflow-version.json') '{ "contract-version": "4.26.0" }'
@@ -2871,6 +2915,14 @@ Describe-Suite 'sdlc managed-hooks / 給管理員的部署包' {
             }
             Assert-Equal 2 $results[$proj] '部署包（腳本不在專案裡）在裝了工作流的專案沒擋下殘留 —— 多半是它在專案裡找自己的檔'
             Assert-Equal 0 $results[$other] '沒裝工作流的 repo 被擋了 —— managed hooks 對這台機器的每個 session 都會叫'
+            Push-Location $proj
+            try {
+                $message = "mode: fix`nfeature-id: f`nround: 1`nspec: bdd-docs/f/spec.md"
+                $payload = New-CodexHookPayload -Event 'PreToolUse' -Tool 'spawn_agent' -ToolInput @{ message = $message }
+                $result = $payload | pwsh -NoProfile -Command $handoffCmd
+                Assert-Equal 0 $LASTEXITCODE '受管交接檢查須從部署包載入修正輪及審查函式'
+                Assert-Match '修正輪 1' ($result | ConvertFrom-Json).hookSpecificOutput.additionalContext
+            } finally { Pop-Location }
         } finally { Remove-Item $SdlcRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 

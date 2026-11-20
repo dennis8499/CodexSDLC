@@ -17,8 +17,14 @@ $script:RepoScanSkip = @('node_modules', 'bin', 'obj', 'packages', '.git', '.vs'
 function Get-WorkspaceRepos([string]$Root) {
     $Root = $Root.TrimEnd('\', '/')
     $repos = @()
-    $null = & git -C $Root rev-parse --is-inside-work-tree 2>$null
-    if ($LASTEXITCODE -eq 0) { $repos += [pscustomobject]@{ dir = $Root; rel = '' } }
+    # Avoid launching Git for standalone workspaces. An ancestor .git file also covers worktrees.
+    $parent = [IO.DirectoryInfo]::new($Root)
+    while ($parent -and -not (Test-Path -LiteralPath (Join-Path $parent.FullName '.git'))) { $parent = $parent.Parent }
+    if ($parent -or $env:GIT_DIR -or $env:GIT_WORK_TREE) {
+        $rootProbe = Invoke-GitUtf8 $Root @('rev-parse', '--is-inside-work-tree')
+        if (-not $rootProbe.ok) { throw '無法讀取工作區的 Git 倉庫' }
+        if ($rootProbe.lines -contains 'true') { $repos += [pscustomobject]@{ dir = $Root; rel = '' } }
+    }
     $level = @([IO.DirectoryInfo]::new($Root))
     $nested = @()
     for ($depth = 1; $depth -le 2 -and $level.Count; $depth++) {

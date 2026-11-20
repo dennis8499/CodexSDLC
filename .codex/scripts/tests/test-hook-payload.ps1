@@ -501,70 +501,88 @@ Describe-Suite 'hook 心跳 / 每支 hook 被叫的時候都要留下痕跡（do
     }
 }
 
-Describe-Suite 'review 快照 / 每一輪審核都留一份（review.md 每輪整份覆寫，PASS 之後前幾輪的必修就不見了）' {
+Describe-Suite 'review 快照 / DLP 掃描審查報告' {
 
-    function Get-Snaps([string]$d) { return @(Get-ChildItem (Join-Path (Get-Location) "$d/reviews") -Filter '*.md' -File -ErrorAction SilentlyContinue) }
-
-    It-Should '寫了乾淨的 review.md → 留一份快照；內容沒變不重留；改了再留一份' {
-        $d = "bdd-docs/rv-$(New-HpId)"
-        New-HpFile "$d/review.md" "VERDICT: FAIL`n`n## 發現`n1. [必修] src/A.cs:10 —— 斷言是空的`n"
-        try {
-            $payload = New-CodexHookPayload -Command (New-CodexPatch -Add "$d/review.md")
-            Assert-Equal 0 (Invoke-Script $DlpGate -Stdin $payload).exit
-            $s = Get-Snaps $d
-            Assert-Equal 1 $s.Count '第一輪的 review.md 沒有留快照 —— PASS 之後這一輪的必修就再也看不到'
-            Assert-Equal ([IO.File]::ReadAllText((Join-Path (Get-Location) "$d/review.md"))) ([IO.File]::ReadAllText($s[0].FullName)) '快照的內容跟 review.md 不一樣'
-            Invoke-Script $DlpGate -Stdin $payload | Out-Null
-            Assert-Equal 1 (Get-Snaps $d).Count '同一份內容留了兩份 —— 一輪審核常是好幾個 patch，learn 會把同一輪算成好幾輪'
-            New-HpFile "$d/review.md" "VERDICT: PASS`n`n## 發現`n1. [建議] src/A.cs:12 —— 命名`n`n## 上一輪必修的交代`n- src/A.cs:10 —— 斷言是空的：已修 —— CancelOrderTests.Rejects 斷言了狀態`n"
-            Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Update "$d/review.md")) | Out-Null
-            Assert-Equal 2 (Get-Snaps $d).Count '第二輪覆寫之後沒有再留一份'
-        } finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+    function Get-Snaps([string]$d) {
+        @(Get-ChildItem -LiteralPath "$d/reviews" -Filter '*.md' -File -ErrorAction SilentlyContinue)
     }
 
-    It-Should '上一份的 [必修] 在新的 review.md 裡沒交代 → 阻斷、不留快照；交代了或照樣列成必修 → 通過' {
-        # PASS 就是從這裡漏出去的：上一輪的必修這一輪沒再提，分不出是修好了還是忘了看。
-        $d = "bdd-docs/rv-$(New-HpId)"
-        $round1 = "VERDICT: FAIL`n`n## 發現`n1. [必修] src/A.cs:10 —— 斷言是空的`n   會怎麼壞：x`n2. [必修] src/B.cs:5 —— 沒擋已出貨`n"
-        New-HpFile "$d/review.md" $round1
-        try {
-            Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Add "$d/review.md")) | Out-Null
-            $upd = New-CodexHookPayload -Command (New-CodexPatch -Update "$d/review.md")
-
-            New-HpFile "$d/review.md" "VERDICT: PASS`n`n## 發現`n1. [建議] src/A.cs:12 —— 命名`n`n## 上一輪必修的交代`n- src/A.cs:10 —— 斷言是空的：已修 —— A 測試`n"
-            $r = Invoke-Script $DlpGate -Stdin $upd
-            Assert-Equal 2 $r.exit '上一輪的必修 src/B.cs 無聲消失，PASS 照樣過了'
-            Assert-Match 'src/B\.cs:5' $r.stderr '沒說是哪一項沒交代'
-            Assert-Equal 1 (Get-Snaps $d).Count '沒交代的那一份被留成快照 —— 下一次寫入就拿它當上一份，B 從此脫鉤'
-
-            New-HpFile "$d/review.md" "VERDICT: PASS`n`n## 上一輪必修的交代`n- src/A.cs:10 —— 斷言是空的：已修 —— A 測試`n- src/B.cs:5 —— 沒擋已出貨：接受不修 ——`n"
-            Assert-Equal 2 (Invoke-Script $DlpGate -Stdin $upd).exit '交代沒寫證據或理由也算數了'
-
-            New-HpFile "$d/review.md" "VERDICT: FAIL`n`n## 發現`n1. [必修] src/B.cs:9 —— 還是沒擋已出貨`n`n## 上一輪必修的交代`n- src/A.cs:10 —— 斷言是空的：已修 —— A 測試`n"
-            $r = Invoke-Script $DlpGate -Stdin $upd
-            Assert-Equal 0 $r.exit "同一個檔照樣列成必修（行號變了）應該算有交代；stderr: $($r.stderr)"
-            Assert-Equal 2 (Get-Snaps $d).Count
-        } finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+    function Remove-HpReviewFixture([string]$d) {
+        $target = Get-Item -LiteralPath $d
+        $docs = (Resolve-Path -LiteralPath 'bdd-docs').Path
+        if ($target.Parent.FullName -ne $docs -or $target.Name -notmatch '^rv-[a-f0-9]{8}$' -or
+            ($target.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Unexpected review fixture cleanup path'
+        }
+        Remove-Item -LiteralPath $target.FullName -Recurse -Force
     }
 
-    It-Should '掃出殘留的 review.md 不留快照（那一份照 runbook 要刪掉）' {
+    It-Should '新增及更新乾淨的審查報告時僅保留原始報告' {
         $d = "bdd-docs/rv-$(New-HpId)"
-        New-HpFile "$d/review.md" "VERDICT: FAIL`n1. [必修] 客戶 carol@contoso.com 的資料 —— 外洩`n"
+        $lf = [string][char]10
         try {
-            Assert-Equal 2 (Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Add "$d/review.md"))).exit
-            Assert-Equal 0 (Get-Snaps $d).Count '敏感資料被快照保存下來了 —— 刪掉 review.md 也刪不掉它'
-        } finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+            foreach ($name in @('review.md', 'spec-review.md')) {
+                $report = "$d/$name"
+                New-HpFile $report ("VERDICT: FAIL$lf$lf## 發現$lf" + '1. [必修] [R-1] src/A.cs:10 —— 例外未驗證')
+                $added = Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Add $report))
+                Assert-Equal 0 $added.exit $added.stderr
+
+                New-HpFile $report "VERDICT: PASS$lf"
+                $updated = Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Update $report))
+                Assert-Equal 0 $updated.exit $updated.stderr
+                Assert-Equal "VERDICT: PASS$lf" ([IO.File]::ReadAllText((Join-Path (Get-Location) $report)))
+            }
+            Assert-True (-not (Test-Path -LiteralPath "$d/reviews"))
+        } finally { Remove-HpReviewFixture $d }
     }
 
-    It-Should '別的檔、手動 -Path 掃都不留快照' {
+    It-Should '掃描新版 review.md 後仍保留原有歷史快照與內容' {
         $d = "bdd-docs/rv-$(New-HpId)"
-        New-HpFile "$d/review.md" "VERDICT: PASS`n"
-        New-HpFile "$d/spec.md" "# spec`n"
+        $snapshot = "$d/reviews/20261029-010000.md"
+        $lf = [string][char]10
+        $legacy = "VERDICT: FAIL$lf$lf## 發現$lf" +
+            "1. [必修] src/A.cs:10 —— 斷言是空的$lf" +
+            "2. [必修] src/B.cs:5 —— 沒擋已出貨$lf"
+        New-HpFile $snapshot $legacy
+        New-HpFile "$d/review.md" "VERDICT: PASS$lf"
         try {
-            Invoke-Script $DlpGate -Params @{ Path = "$d/review.md" } | Out-Null
-            Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Add "$d/spec.md")) | Out-Null
-            Assert-Equal 0 (Get-Snaps $d).Count '不是 hook 寫 review.md 的那一刻也留了快照'
-        } finally { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+            $r = Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Update "$d/review.md"))
+            Assert-Equal 0 $r.exit $r.stderr
+            $snapshots = @(Get-Snaps $d)
+            Assert-Equal 1 $snapshots.Count
+            Assert-Equal '20261029-010000.md' $snapshots[0].Name
+            Assert-Equal $legacy ([IO.File]::ReadAllText($snapshots[0].FullName))
+        } finally { Remove-HpReviewFixture $d }
+    }
+
+    It-Should '啟用時阻擋審查報告裡的敏感資料且只回類別' {
+        $d = "bdd-docs/rv-$(New-HpId)"
+        $lf = [string][char]10
+        $email = 'carol@contoso.com'
+        New-HpFile "$d/review.md" ("VERDICT: FAIL$lf" + "1. [必修] 客戶 $email 的資料 —— 外洩$lf")
+        try {
+            $r = Invoke-Script $DlpGate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Add "$d/review.md"))
+            Assert-Equal 2 $r.exit
+            Assert-Match 'email' $r.stderr
+            Assert-True ($r.stderr -notmatch [regex]::Escape($email))
+            Assert-Equal 0 @(Get-Snaps $d).Count
+        } finally { Remove-HpReviewFixture $d }
+    }
+
+    It-Should '停用時回報未掃描並保留審查報告原檔' {
+        $d = "bdd-docs/rv-$(New-HpId)"
+        $marker = "$d/.dlp-disabled"
+        $report = 'VERDICT: PASS. 聯絡人 carol@contoso.com'
+        New-HpFile "$d/review.md" $report
+        New-HpFile $marker 'test opt-out'
+        try {
+            $payload = New-CodexHookPayload -Command (New-CodexPatch -Update "$d/review.md")
+            $r = Invoke-Script $DlpGate -Stdin $payload -Params @{ DisableMarker = $marker }
+            Assert-Equal 0 $r.exit $r.stderr
+            Assert-Match '已被 .*\.dlp-disabled 關閉' (Get-HookContext $r.stdout).additionalContext
+            Assert-Equal $report ([IO.File]::ReadAllText((Join-Path (Get-Location) "$d/review.md")))
+            Assert-Equal 0 @(Get-Snaps $d).Count
+        } finally { Remove-HpReviewFixture $d }
     }
 }
 

@@ -114,7 +114,7 @@ $gates = [ordered]@{ dlp = 'none'; guideline = 'none'; build = 'none' }
 # ---- 1. 殘留掃描 ----
 if ($docFiles.Count) {
     $dlp = Invoke-Gate 'dlp-gate.ps1' @{ Path = $docFiles; Json = $true }
-    if (-not $dlp) { $gates.dlp = 'error'; $notices.Add('殘留掃描沒有回結果（dlp-gate）—— 這次沒掃；自己跑一次看訊息：pwsh -NoProfile -File .codex/scripts/dlp-gate.ps1 -Path <檔>') }
+    if (-not $dlp -or $dlp.status -eq 'error') { $gates.dlp = 'error'; $notices.Add('殘留掃描執行失敗（dlp-gate）。可單獨執行查看原因：pwsh -NoProfile -File .codex/scripts/dlp-gate.ps1 -Path <檔>') }
     elseif ($dlp.disabled) { $gates.dlp = 'disabled'; $notices.Add("殘留掃描已被 $DocsRoot/.dlp-disabled 關閉 —— 這次沒掃 $($docFiles.Count) 個 $DocsRoot/ 的檔。") }
     elseif ($dlp.passed) { $gates.dlp = 'passed' }
     else {

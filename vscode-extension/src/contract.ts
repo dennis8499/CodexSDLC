@@ -644,13 +644,14 @@ export function parseRulesValidation(stdout: string): RulesValidation {
 
 export interface DlpCategory { type: string; count: number; lines: number[] }
 export interface DlpFinding { file: string; categories: DlpCategory[] }
-export interface DlpGateResult { disabled: boolean; scanned: string[]; findings: DlpFinding[] }
+export interface DlpGateResult { disabled: boolean; scanned: string[]; findings: DlpFinding[]; executionError?: boolean }
 
 export function parseDlpGate(stdout: string): DlpGateResult {
   const o = parseJsonObject(stdout, 'dlp-gate');
   if (!('disabled' in o)) throw new ContractError('dlp-gate 的 -Json 沒有 disabled —— 工作流版本太舊');
   return {
     disabled: bool(o, 'disabled', '$'),
+    executionError: o.status === 'error',
     scanned: strArr(o, 'scanned', '$'),
     findings: arr(o, 'findings', '$').map((f, i) => {
       const fat = `$.findings[${i}]`;

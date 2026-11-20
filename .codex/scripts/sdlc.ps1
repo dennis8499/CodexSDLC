@@ -489,6 +489,9 @@ function Merge-Config($cfg, [string]$srcRoot, [string]$newVersion) {
     $added = @()
     $agentDir = Join-Path $srcRoot '.codex/agents'
     if (Test-Path $agentDir) {
+        if ($null -eq $cfg.agents) {
+            $cfg | Add-Member -NotePropertyName 'agents' -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
         foreach ($n in @(Get-ChildItem $agentDir -Filter *.toml -File | ForEach-Object { $_.BaseName } | Sort-Object)) {
             if (-not (Get-AgentConfig $cfg $n)) {
                 $cfg.agents | Add-Member -NotePropertyName $n -NotePropertyValue ([pscustomobject]@{ model = 'inherit'; effort = 'inherit' })
@@ -496,7 +499,7 @@ function Merge-Config($cfg, [string]$srcRoot, [string]$newVersion) {
             }
         }
     }
-    $cfg.'workflow-version' = $newVersion
+    $cfg | Add-Member -NotePropertyName 'workflow-version' -NotePropertyValue $newVersion -Force
     return $added
 }
 
@@ -1109,7 +1112,7 @@ function Get-HookHeartbeat([string]$target) {
     $evidence = @()
     if (Test-Path (Join-Path $docs 'project-map.md')) { $evidence += Get-Item (Join-Path $docs 'project-map.md') }
     foreach ($f in @(Get-ChildItem $docs -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') })) {
-        $evidence += @(Get-ChildItem $f.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('analysis.md', 'current-state.md', 'review.md') })
+        $evidence += @(Get-ChildItem $f.FullName -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('analysis.md', 'current-state.md', 'spec-review.md', 'review.md') })
         foreach ($sub in @('evidence', 'contract')) {
             $evidence += @(Get-ChildItem (Join-Path $f.FullName $sub) -File -Recurse -ErrorAction SilentlyContinue)
         }
@@ -3054,6 +3057,16 @@ function Invoke-Doctor {
     $script:Data.version = [ordered]@{ contract = [string]$v.contract; minCompatible = [string]$v.minCompat }
     Say "版本 $($v.contract)（最低相容 $($v.minCompat)）"
 
+    $legacyAgentSandbox = @(Get-ChildItem (Join-Path $Target '.codex/agents') -Filter *.toml -File -ErrorAction SilentlyContinue |
+        Sort-Object Name | Where-Object {
+            $header = ([IO.File]::ReadAllText($_.FullName) -split '(?m)^[ \t]*developer_instructions[ \t]*=', 2)[0]
+            $header -match '(?m)^[ \t]*sandbox_mode[ \t]*='
+        } | ForEach-Object Name)
+    $script:Data.legacyAgentSandbox = $legacyAgentSandbox
+    if ($legacyAgentSandbox.Count) {
+        Warn "$($legacyAgentSandbox -join '、') 含舊欄位 sandbox_mode。子代理的 sandbox 與核准權限繼承父工作階段，請在父工作階段設定所需權限。"
+    }
+
     $cfgPath = Join-Path $Target $ConfigFile
     $cfg = Read-JsonFile $cfgPath
     $script:Data.unverifiedModel = @()
@@ -3231,54 +3244,45 @@ function Invoke-Models {
 # 同一需求內去重；「哪幾項是同一類、該寫成什麼規則」要讀懂問題才分得出來，交給 skill `review-learning`。
 # **一個字都不寫**：規範是團隊的，寫進去要他點頭。
 #
-# 來源：bdd-docs/{feature-id}/reviews/*.md（dlp-gate 替每一輪留的快照，4.19.0 起）＋ 最新的 review.md。
-# 更早的需求只剩最後一輪 —— PASS 那一輪通常只有 [建議]，已經修掉的 [必修] 看不到。
-function Read-ReviewFindings([string]$file) {
-    $lines = [IO.File]::ReadAllLines($file)
-    $out = @()
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $m = [regex]::Match($lines[$i], '^\s*\d+\.\s*\[(必修|建議)\]\s*(.+?)\s+——\s+(.+?)\s*$')
-        if (-not $m.Success) { continue }
-        $loc = $m.Groups[2].Value.Trim().Trim('`', '{', '}')
-        $failure = $null
-        if ($i + 1 -lt $lines.Count) {
-            $f = [regex]::Match($lines[$i + 1], '^\s+會怎麼壞[:：]\s*(.+?)\s*$')
-            if ($f.Success) { $failure = $f.Groups[1].Value }
-        }
-        $out += [pscustomobject]@{
-            severity = $m.Groups[1].Value
-            location = $loc
-            file     = ($loc -replace '(:\d+(-\d+)?)+$', '')
-            problem  = $m.Groups[3].Value
-            failure  = $failure
-        }
-    }
-    return $out
-}
-
 function Invoke-Learn {
     if (-not (Get-ContractVersion $Target)) { Warn "$VersionRel 不存在或解析不了。"; $script:Data.error = 'not-installed'; return 2 }
+    . (Join-Path $PSScriptRoot 'lib/review-state.ps1')
     $root = (Resolve-Path $Target).Path
     $docs = Join-Path $root 'bdd-docs'
     $features = @(); $all = @(); $snapshots = 0
     foreach ($d in @(Get-ChildItem $docs -Directory -ErrorAction SilentlyContinue | Where-Object { -not $_.Name.StartsWith('.') } | Sort-Object Name)) {
         $snaps = @(Get-ChildItem (Join-Path $d.FullName 'reviews') -Filter '*.md' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc, Name)
         $sources = @($snaps | ForEach-Object { $_.FullName })
-        $latest = Join-Path $d.FullName 'review.md'
-        # 最新那份通常就是最後一個快照；內容一樣就不重讀。
-        if ((Test-Path $latest) -and -not ($snaps.Count -and [IO.File]::ReadAllText($latest) -eq [IO.File]::ReadAllText($snaps[-1].FullName))) { $sources += $latest }
+        foreach ($report in @('spec-review.md', 'review.md')) {
+            $latest = Join-Path $d.FullName $report
+            if ((Test-Path -LiteralPath $latest) -and -not ($snaps.Count -and [IO.File]::ReadAllText($latest) -eq [IO.File]::ReadAllText($snaps[-1].FullName))) { $sources += $latest }
+        }
         if (-not $sources.Count) { continue }
         $snapshots += $snaps.Count
+        $counts = @{}
+        $completed = @()
+        try {
+            $completed = @((Read-ReviewState $d.FullName).reviews | Where-Object status -eq 'completed')
+            foreach ($review in $completed) {
+                foreach ($finding in @($review.issues | Where-Object state -eq 'open')) { $counts[$finding.id]++ }
+            }
+        } catch { Warn "讀不到 $($d.Name) 的審查版本紀錄，已讀取現有報告" }
         $seen = [ordered]@{}
         foreach ($s in $sources) {
-            foreach ($f in @(Read-ReviewFindings $s)) {
-                $key = "$($f.severity)|$($f.file)|$(($f.problem -replace '\s+', ' ').Trim())"
-                if ($seen.Contains($key)) { $seen[$key].rounds++; continue }
-                $seen[$key] = [ordered]@{ feature = $d.Name; severity = $f.severity; location = $f.location; file = $f.file; problem = $f.problem; failure = $f.failure; rounds = 1 }
+            foreach ($f in @(Read-ReviewFindings ([IO.File]::ReadAllText($s)))) {
+                $key = if ($f.id) { $f.id } else { "$($f.severity)|$($f.file)|$(($f.problem -replace '\s+', ' ').Trim())" }
+                if ($seen.Contains($key) -and (-not $f.id -or -not $counts.ContainsKey($f.id))) { $seen[$key].rounds++; continue }
+                $item = [ordered]@{ feature = $d.Name; severity = $f.severity; location = $f.location; file = $f.file; problem = $f.problem; failure = $f.failure; rounds = 1 }
+                if ($f.id) {
+                    $item.id = $f.id
+                    if ($counts.ContainsKey($f.id)) { $item.rounds = $counts[$f.id] }
+                }
+                $seen[$key] = $item
             }
         }
         $items = @($seen.Values)
-        $features += [ordered]@{ id = $d.Name; rounds = $sources.Count; snapshots = $snaps.Count; findings = $items.Count }
+        $roundCount = if ($completed.Count) { $completed.Count + $snaps.Count } else { $sources.Count }
+        $features += [ordered]@{ id = $d.Name; rounds = $roundCount; snapshots = $snaps.Count; findings = $items.Count }
         $all += $items
     }
 
@@ -3302,7 +3306,7 @@ function Invoke-Learn {
     }
     Say "讀了 $($features.Count) 個需求的審核紀錄（$snapshots 份每輪快照）：$($all.Count) 項發現，其中 [必修] $($must.Count) 項。"
     $noSnap = @($features | Where-Object { $_.snapshots -eq 0 } | ForEach-Object { $_.id })
-    if ($noSnap.Count) { Say "  沒有每輪快照、只看得到最後一輪的：$($noSnap -join '、')（4.19.0 以前跑的；已經修掉的 [必修] 看不到）" }
+    if ($noSnap.Count) { Say "  $($noSnap -join '、') 的版本與發現來自現有審查紀錄。" }
     foreach ($f in @($must | Select-Object -First 20)) { Say "  [必修] $($f.feature)　$($f.location) —— $($f.problem)" }
     if ($must.Count -gt 20) { Say "  ……另外 $($must.Count - 20) 項（-Json 看全部）" }
     Say '要把一再出現的那幾類寫成規範：在 Codex 裡說「把審核一再抓到的問題整理成規範」—— 它照 skill review-learning 歸類、起草，等你確認才寫進 guidelines/。'
@@ -3385,7 +3389,7 @@ function Invoke-ManagedHooks {
 #      裝在 git 自己的 hooks 目錄（git rev-parse --git-path）—— 每份 clone 各自一份、不進版控：這是「這台機器的 Codex
 #      hooks 跑不起來」的補位，不是整個團隊的設定。repo 已經有自己的 pre-commit、或設了 core.hooksPath（husky、公司統一的
 #      hooks）→ 一個字都不動，給一行讓人自己加進去：蓋掉別人的 hook 比沒裝更糟。
-#   2. 寫 bdd-docs/.cache/no-codex-hooks：AGENTS.md 叫 orchestrator 看到它就在每次委派前自己跑 handoff-lint -SelfCheck
+#   2. 寫 bdd-docs/.cache/no-codex-hooks：AGENTS.md 用 handoff-lint -SelfCheck 預覽，正式委派前加 -Register
 #      （委派的內容不落地、不經過 git，沒有機械的替代）。
 # hook 本身只負責找到工作流、叫 commit-check：規則都在 commit-check 與三支 gate 裡，update 升級它們，hook 不必重裝。
 $GitHookMarker = 'codex-sdlc pre-commit'
@@ -3457,7 +3461,7 @@ function Show-GitHooks($gh) {
         Say "commit 前的檢查（git-hooks）：裝在 $(@($mine | ForEach-Object { $_.repo }) -join '、')$(if ($mine.Count -lt @($gh.repos).Count) { "（共 $(@($gh.repos).Count) 個 repo）" })。"
     }
     if (@($mine | Where-Object status -eq 'outdated').Count) { Say '  其中有舊版的 pre-commit —— 重跑 sdlc.ps1 git-hooks 更新。' }
-    if ($gh.marker) { Say "  $NoHooksMarkerRel 在：orchestrator 每次委派前自己跑 handoff-lint。Codex hooks 能跑了（管理員部署了 managed hooks）就 git-hooks -Remove。" }
+    if ($gh.marker) { Say "  $NoHooksMarkerRel 在：orchestrator 正式委派前跑 handoff-lint -SelfCheck -Register。Codex hooks 能跑了（管理員部署了 managed hooks）就 git-hooks -Remove。" }
     elseif ($mine.Count) { Say "  $NoHooksMarkerRel 不在：orchestrator 不會自己跑 handoff-lint —— Codex hooks 跑不起來的話重跑 sdlc.ps1 git-hooks。" }
 }
 
@@ -3505,7 +3509,7 @@ function Invoke-GitHooks {
         if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force; Say "拿掉了 $NoHooksMarkerRel —— orchestrator 不再自己跑 handoff-lint。" }
     } else {
         [void][IO.Directory]::CreateDirectory((Split-Path $marker -Parent))
-        [IO.File]::WriteAllText($marker, "這台機器的 Codex hooks 跑不起來（組織政策只允許管理員部署的 hooks）—— sdlc.ps1 git-hooks 寫的。`norchestrator 看到這個檔：每次委派前自己跑 handoff-lint -SelfCheck（AGENTS.md 的「機械強制層」）。`nCodex hooks 能跑了（管理員部署了 managed hooks）：sdlc.ps1 git-hooks -Remove。`n", $Utf8NoBom)
+        [IO.File]::WriteAllText($marker, "這台機器的 Codex hooks 跑不起來（組織政策只允許管理員部署的 hooks）—— sdlc.ps1 git-hooks 寫的。`norchestrator 正式委派前跑 handoff-lint -SelfCheck -Register。只預覽時用 -SelfCheck。`nCodex hooks 能跑了（管理員部署了 managed hooks）：sdlc.ps1 git-hooks -Remove。`n", $Utf8NoBom)
     }
     $script:Data.gitHooks = [ordered]@{ action = $(if ($Remove) { 'remove' } else { 'install' }); root = $root; marker = $NoHooksMarkerRel; markerPresent = (Test-Path -LiteralPath $marker); repos = @($results); manualLine = $manual }
     if ($Remove) { return 0 }

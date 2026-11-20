@@ -19,6 +19,7 @@ export interface ScanOutcome {
   scanned: string[];     // 這次 gate 真的看過的檔（要清掉舊的診斷）
   records: DiagnosticRecord[];
   note?: string;         // 「被關掉了」這類要讓人知道、但不是某一行的事
+  incomplete?: boolean;
 }
 
 const norm = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '');
@@ -55,17 +56,22 @@ export function dlpOutcome(r: DlpGateResult): ScanOutcome {
       }
     }
   }
+  let note: string | undefined;
+  if (r.executionError) note = '殘留掃描執行失敗，請檢查掃描工具後重跑。';
+  else if (r.disabled) note = 'bdd-docs/.dlp-disabled 還在 —— 殘留掃描是關的。';
   return {
     scanned: r.scanned.map(norm),
     records,
-    note: r.disabled ? 'bdd-docs/.dlp-disabled 還在 —— 殘留掃描是關的。' : undefined,
+    note,
+    incomplete: r.executionError,
   };
 }
 
 // 把紀錄依檔分組；沒有紀錄但被掃過的檔也要出現（值是空陣列），呼叫端才會清掉它上一次的診斷。
 export function groupByFile(outcome: ScanOutcome, requested: string[]): Map<string, DiagnosticRecord[]> {
   const map = new Map<string, DiagnosticRecord[]>();
-  for (const f of [...requested.map(norm), ...outcome.scanned]) map.set(f, []);
+  const files = outcome.incomplete ? outcome.scanned : [...requested.map(norm), ...outcome.scanned];
+  for (const f of files) map.set(f, []);
   for (const r of outcome.records) {
     const list = map.get(r.file) ?? [];
     list.push(r);

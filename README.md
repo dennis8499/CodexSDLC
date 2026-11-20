@@ -55,7 +55,8 @@ Codex 的 SDLC 工作流涵蓋需求、分析、定案、test-first 實作、獨
 - 驗收條件須於全套測試結果中逐條通過，且結果晚於最後一次修改（`gherkin-check`）。QA 手動測試者標 `@manual`。
 - 修改既有功能時，③ 列出改動範圍（既有行為改前→改後、會改的既有檔與表、連帶影響、要改的既有測試）供確認；實作超出範圍須先回報取得同意。
 - 缺陷先建立重現症狀的失敗測試並找出原因，修法與改動範圍經確認後才修改程式；純技術變更可省略 ①。
-- 審核修正輪有上限；同一檔的必修修過兩輪仍在，交回使用者決定。
+- 依[審查與交付指引](.codex/bdd-workflow/runbooks/review-evidence.md)登記核准規格及受審版本。交付會核對程式碼審查、實作與測試指紋及每個必修 ID。
+- 同一必修修過兩輪仍在時，交回使用者決定。正常輪用完仍有必修時，使用者可[授權額外一輪](.codex/bdd-workflow/runbooks/fix-rounds.md)。
 
 ## 前後端分離
 
@@ -66,6 +67,8 @@ Codex 的 SDLC 工作流涵蓋需求、分析、定案、test-first 實作、獨
 - 未指明時，前端可能先行，替身僅能依 `spec.md` 的文字描述，接上後端時才發現不符。
 - API 另有外部消費者（行動 App、第三方），或前後端由不同人員分頭開發時，才先以 `sa-analyst` 的 `contract` 模式產出 API 規格。
 - 僅以替身驗證不代表前後端可正確串接；③ 選擇交付範圍時應包含整合驗證。
+
+使用者指定一個團隊試行風險分流時，依[單一團隊前後端試行](.codex/bdd-workflow/runbooks/team-pilot.md)選流程，記錄真實 API 與 UI 的驗收證據及觀察資料。
 
 ### UI 驗收方式
 
@@ -86,7 +89,8 @@ Codex 的 SDLC 工作流涵蓋需求、分析、定案、test-first 實作、獨
 | --- | --- |
 | `bdd-docs/{feature-id}/spec.md` | 需求決議、做法、改動範圍、驗收條件、交付紀錄 |
 | `bdd-docs/{feature-id}/data-model.md` | 資料表設計（新增與修改的表、欄位、型別、鍵、索引、既有資料處理）；③ 確認、④ 依此建立 |
-| `bdd-docs/{feature-id}/review.md`、`reviews/` | 審核結論與各輪紀錄 |
+| `bdd-docs/{feature-id}/spec-review.md` | 規格草案審查 |
+| `bdd-docs/{feature-id}/review.md`、`reviews/` | 程式碼審查報告及核准、審查、委派紀錄 |
 | `bdd-docs/{feature-id}/evidence/`、`contract/` | 經核准的 DB 盤點、對外契約 |
 | `bdd-docs/project-map.md` | 系統地圖與領域詞彙 |
 | `bdd-docs/.sdlc/` | 升級基準線與備份（勿刪） |
@@ -111,6 +115,8 @@ pwsh .codex/scripts/sdlc.ps1 set -Preset balanced   # fast／balanced／deep
 
 `agents.*` 須經 `-Apply` 生效。
 
+角色的沙箱與核准權限由父工作階段決定。CLI 與 VS Code 的唯讀工作階段可用於檢查。產出、登記與修正需要已授權可寫的工作區。 [Codex 子代理權限](https://learn.chatgpt.com/docs/agent-configuration/subagents#approvals-and-sandbox-controls)
+
 ## 團隊規範
 
 `guidelines/` 的 `*.md` 為需判斷的規範（違反 MUST 判為必修），`rules.json` 為寫檔時機械檢查的規則。各規範由對應角色在任務需要時讀取。見[團隊規範使用說明](.codex/bdd-workflow/guidelines-guide.md)。
@@ -124,7 +130,7 @@ pwsh .codex/scripts/sdlc.ps1 git-hooks
 ```
 
 - **commit 前檢查**：工作區每個 repo 安裝 `pre-commit`（位於 `.git/hooks`，每份 clone 各自一份、不進版控），執行 `.codex/scripts/commit-check.ps1`：staged 的 `bdd-docs/` 檔做殘留掃描，其餘檔套用 `rules.json` 的 block 規則，含 production 程式碼時 build。
-- **委派前檢查**：寫入 `bdd-docs/.cache/no-codex-hooks`；orchestrator 見到此檔即於每次委派前自行執行 `handoff-lint -SelfCheck`。此項依賴模型遵守，不是機械強制。
+- **委派前檢查**：寫入 `bdd-docs/.cache/no-codex-hooks`。orchestrator 每次委派前執行 `handoff-lint -SelfCheck`。正式修正輪加 `-Register`，送出結果依[收據指引](.codex/bdd-workflow/runbooks/fix-rounds.md)記錄。
 - **CI**：`git commit --no-verify` 可略過本機檢查。需強制時於 pipeline 執行（clone 須含完整歷史）：
 
   ```powershell
@@ -136,7 +142,7 @@ pwsh .codex/scripts/sdlc.ps1 git-hooks
 限制：
 - 問題在 commit 前才被發現，不是寫檔當下，修正成本較高。
 - 檢查的是工作區內容；stage 後又修改的檔會列出提醒。
-- 審核紀錄的「上一輪必修交代」檢查與審核快照仍需 Codex hooks。
+- 審查完成時主動登記，由交付檢查核對審查類型、版本及上一輪必修的處置。
 - repo 已有自己的 `pre-commit` 或設定了 `core.hooksPath` 時不覆蓋，改為列出需自行加入的一行。
 - 移除：`git-hooks -Remove`。管理員日後部署 managed hooks 時應移除，否則委派前會重複檢查。
 
@@ -152,6 +158,8 @@ pwsh <新版目錄>/.codex/scripts/sdlc.ps1 update -Target <專案路徑>   # -P
 
 - 使用者改過的工具檔先備份至 `bdd-docs/.sdlc/backup-{舊版}/` 再更新。團隊自訂的 `guidelines/` 會保留，舊版原廠 `guidelines/README.md` 可能換成新版索引。
 - `hooks.json` 變更後，用 `update -TrustHooks` 或事後執行 `trust-hooks` 重新信任。以 `pwsh .codex/scripts/sdlc.ps1 whatsnew` 查閱版本變更。
+- 組織若由管理員部署受管 hooks，配合已安裝版本更新受管腳本及其依賴，再以 `doctor -CheckHookTrust` 核對。
+- 已結案的舊審查可繼續讀取。待交付的舊需求若缺審查類型或版本，依審查指引補做一次程式碼審查。
 - `update.source` 格式：`https://github.com/<owner>/<repo>`、`https://gitlab.com/<group>/<project>`，或 `gitea:<url>`／`gitlab:<url>`／`github:<url>`。私有 repo 的 token 置於 `CODEX_SDLC_TOKEN_<主機>`。
 
 ## 疑難排解
@@ -165,5 +173,5 @@ pwsh <新版目錄>/.codex/scripts/sdlc.ps1 update -Target <專案路徑>   # -P
 | `gherkin-check`：找不到 scenario 的測試 | 確認 step 已繫結、結果檔為全套測試；手動測試者標 `@manual` |
 | `gherkin-check`：結果檔比改過的檔舊 | 重跑測試 |
 | 委派被擋：`review-loop-exceeded`／`review-item-stuck` | 由使用者決定後續 |
-| `delivery-check` 未通過 | 依列出的項目補齊「交付」一節或重跑測試 |
+| `delivery-check` 未通過 | 依回報補審當前版本、處置必修、補測試證據或修復執行失敗的檢查 |
 | 寫檔被擋：`[Hook][Guideline]` | 依規則修正，或將規則降為 `warn` |

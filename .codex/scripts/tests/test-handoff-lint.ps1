@@ -163,6 +163,23 @@ Describe-Suite 'handoff-lint / 驗收依據與修正輪' {
         Assert-Match 'missing-round' $r.stderr
     }
 
+    $invalidRounds = @(
+        @{ Name = '第 0 輪'; Value = '0' }
+        @{ Name = '負數'; Value = '-1' }
+        @{ Name = '小數'; Value = '1.5' }
+        @{ Name = '數字後有文字'; Value = '3 trailing' }
+        @{ Name = '整數溢位'; Value = '99999999999999' }
+        @{ Name = '重複欄位'; Value = "1`n- round: 3" }
+    )
+    foreach ($case in $invalidRounds) {
+        It-Should "mode: fix 無效 round 拒絕（$($case.Name)）" {
+            $p = ($ValidBuild -replace 'mode: build', "mode: fix`n- round: $($case.Value)")
+            $r = Invoke-Script $Script -Stdin $p -Params @{ ConfigFile = $NoConfig; SelfCheck = $true; Json = $true }
+            Assert-Equal 2 $r.exit
+            Assert-Equal 'invalid-round' ($r.stdout | ConvertFrom-Json).violations[0].rule
+        }
+    }
+
     It-Should 'mode: fix 第 3 輪通過（沒有設定時上限是 3）' {
         $p = ($ValidBuild -replace 'mode: build', "mode: fix`n- round: 3")
         $r = Invoke-Script $Script -Stdin (New-Payload -Prompt $p) -Params @{ ConfigFile = $NoConfig }
@@ -595,16 +612,15 @@ Describe-Suite 'handoff-lint / 同一個檔的必修修了兩輪還在（review-
 Describe-Suite 'handoff-lint / -SelfCheck（Codex hooks 跑不起來時 orchestrator 自己跑）' {
 
     # 組織政策只允許管理員部署的 hooks、管理員又不部署時，這支一次都不會被 Codex 叫。orchestrator 照 AGENTS.md 自己把
-    # handoff 從 stdin 交進來 —— 檢查要跟 hook 一模一樣，而 hook 才做的兩件事（記帳、把修正輪那一行交給它）不能少：
-    # 少了記帳，「修了兩輪還在」永遠判不出來；少了那一行，設成 5 輪時它照預設在第 3 輪停下。
+    # 預覽與 hooks 使用一樣的判定。正式委派才用 -Register 記帳。
     $ScDir = 'bdd-docs/order-cancel'
     function Set-ScReview([string]$file) {
         New-Item -ItemType Directory -Path $ScDir -Force | Out-Null
         [IO.File]::WriteAllText((Join-Path (Get-Location) "$ScDir/review.md"), "VERDICT: FAIL`n`n## 發現`n1. [必修] $file`:10 —— 已出貨的沒被擋下`n", [Text.UTF8Encoding]::new($false))
     }
-    function Invoke-ScFix([int]$round) {
+    function Invoke-ScFix([int]$round, [switch]$Register) {
         $msg = "## meta`n- feature-id: order-cancel`n- mode: fix`n- round: $round`n- spec: bdd-docs/order-cancel/spec.md`n`n## summary`n照 review.md 的必修修。"
-        return Invoke-Script $Script -Stdin $msg -Params @{ MaxReviewRounds = 5; SelfCheck = $true }
+        return Invoke-Script $Script -Stdin $msg -Params @{ MaxReviewRounds = 5; SelfCheck = $true; Register = $Register }
     }
 
     It-Should '放行：stdout 說通過，修正輪那一行也在 stdout（沒有 hook 替它轉成 additionalContext）' {
@@ -615,16 +631,17 @@ Describe-Suite 'handoff-lint / -SelfCheck（Codex hooks 跑不起來時 orchestr
             Assert-Match '通過' $r.stdout
             Assert-Match '修正輪 1／上限 5' $r.stdout 'orchestrator 不讀設定檔，知道上限的唯一途徑就是這一行'
             Assert-True ($r.stdout -notmatch 'hookSpecificOutput') '不是 hook 在叫，卻寫了 hook 的 JSON'
+            Assert-True (-not (Test-Path "$ScDir/reviews/fix-rounds.json")) '預覽寫入了修正輪紀錄'
         } finally { Remove-Item 'bdd-docs' -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
     It-Should '記帳：同一個檔修了兩輪還在 → 第 3 輪擋下（跟 hook 一樣）' {
         try {
             Set-ScReview 'src/A.cs'
-            Assert-Equal 0 (Invoke-ScFix 1).exit
-            Assert-Equal 0 (Invoke-ScFix 2).exit
+            Assert-Equal 0 (Invoke-ScFix 1 -Register).exit
+            Assert-Equal 0 (Invoke-ScFix 2 -Register).exit
             $r = Invoke-ScFix 3
-            Assert-Equal 2 $r.exit '-SelfCheck 沒記帳 —— 沒有 hooks 的機器永遠判不出「修了兩輪還在」'
+            Assert-Equal 2 $r.exit '-SelfCheck -Register 沒記帳 —— 沒有 hooks 的機器永遠判不出「修了兩輪還在」'
             Assert-Match 'review-item-stuck' $r.stderr
         } finally { Remove-Item 'bdd-docs' -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -633,5 +650,217 @@ Describe-Suite 'handoff-lint / -SelfCheck（Codex hooks 跑不起來時 orchestr
         $r = Invoke-Script $Script -Stdin (Get-FixHandoff 4) -Params @{ SelfCheck = $true; MaxReviewRounds = 3 }
         Assert-Equal 2 $r.exit
         Assert-Match 'review-loop-exceeded' $r.stderr
+    }
+}
+
+$ApprovedFixScript = (Resolve-Path -LiteralPath '.codex/scripts/handoff-lint.ps1').Path
+$ApprovedReviewScript = (Resolve-Path -LiteralPath '.codex/scripts/review-check.ps1').Path
+$ApprovedFeature = 'round-approval'
+$ApprovedDoc = "bdd-docs/$ApprovedFeature"
+$ApprovedLedger = "$ApprovedDoc/reviews/fix-dispatches.json"
+$ApprovedSpec = "# 修正輪測試`n`n## 驗收`n使用合成測試專案。`n"
+
+function Invoke-ApprovedFixTest([scriptblock]$Test) {
+    $temp = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path
+    $root = Join-Path $temp ("codex-fix-" + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($root)
+    Push-Location $root
+    try {
+        New-Item -ItemType Directory -Path $ApprovedDoc, 'src' | Out-Null
+        Set-Content -LiteralPath "$ApprovedDoc/spec.md" -Value $ApprovedSpec -Encoding utf8
+        Set-Content -LiteralPath 'src/App.ps1' -Value '# initial revision' -Encoding utf8
+        Invoke-ApprovedReview @{ Action = 'Approve'; Risk = 'general'; Scope = 'src/App.ps1' } | Out-Null
+        & $Test
+    } finally {
+        Pop-Location
+        $target = (Resolve-Path -LiteralPath $root).Path
+        if ([IO.Path]::GetDirectoryName($target) -eq $temp -and [IO.Path]::GetFileName($target) -match '^codex-fix-[a-f0-9]{32}$') {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+    }
+}
+
+function Invoke-ApprovedReview([hashtable]$Params) {
+    $result = Invoke-Script $ApprovedReviewScript -Params ($Params + @{ FeatureId = $ApprovedFeature; Json = $true })
+    Assert-Equal 0 $result.exit "review-check failed: $($result.stdout) $($result.stderr)"
+    return ($result.stdout | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Set-ApprovedReview([int]$Version) {
+    Set-Content -LiteralPath 'src/App.ps1' -Value "# review fixture version $Version" -Encoding utf8
+    $started = Invoke-ApprovedReview @{ Action = 'Start'; Mode = 'code' }
+    $report = @"
+REVIEW-ID: $($started.review_id)
+VERDICT: FAIL
+
+## 發現
+1. [必修] [R-1] src/App.ps1:1 —— 保留原問題識別碼
+2. [必修] [R-2] src/App.ps1:2 —— 同一個檔案的不同問題
+"@
+    Set-Content -LiteralPath "$ApprovedDoc/review.md" -Value $report -Encoding utf8
+    Invoke-ApprovedReview @{ Action = 'Complete'; ReviewId = $started.review_id } | Out-Null
+    return $started.review_id
+}
+
+function Set-ApprovedExtra([int]$Round, [string]$ReviewId, [string[]]$Issues = @('R-1'), [int]$Iteration = 1) {
+    $approval = @{
+        feature_id = $ApprovedFeature; iteration = $Iteration; review_id = $ReviewId; round = $Round
+        issue_ids = $Issues; decision = '使用者同意此版本加跑一輪，範圍如列。'
+    } | ConvertTo-Json -Compress
+    $fence = [string][char]96 * 3
+    $previous = [IO.File]::ReadAllText((Join-Path (Get-Location).Path "$ApprovedDoc/spec.md"))
+    Set-Content -LiteralPath "$ApprovedDoc/spec.md" -Value "$previous`n## 修正授權`n`n$($fence)json`n$approval`n$fence" -Encoding utf8
+}
+
+function Get-ApprovedFixPrompt([int]$Round, [string]$Issues, [switch]$AllowStuck) {
+    $prompt = "mode: fix`nfeature-id: $ApprovedFeature`nround: $Round`nissue-ids: $Issues`nspec: $ApprovedDoc/spec.md"
+    if ($AllowStuck) { $prompt += "`nstuck-approved: yes" }
+    return $prompt
+}
+
+function Invoke-ApprovedFix([int]$Round, [int]$Maximum, [string]$Issues = 'R-1', [switch]$Register, [switch]$Hook, [switch]$AllowStuck) {
+    $prompt = Get-ApprovedFixPrompt $Round $Issues -AllowStuck:$AllowStuck
+    if ($Hook) {
+        $payload = New-CodexHookPayload -Event 'PreToolUse' -Tool 'send_input' -ToolInput @{ message = $prompt }
+        return Invoke-Script $ApprovedFixScript -Stdin $payload -Params @{ MaxReviewRounds = $Maximum }
+    }
+    return Invoke-Script $ApprovedFixScript -Stdin $prompt -Params @{ MaxReviewRounds = $Maximum; SelfCheck = $true; Register = [bool]$Register; Json = $true }
+}
+
+function Complete-ApprovedNormalRounds([int]$Maximum) {
+    foreach ($round in 1..$Maximum) {
+        Set-ApprovedReview $round | Out-Null
+        if ($round % 2 -eq 0) {
+            $result = Invoke-ApprovedFix $round $Maximum -Issues 'R-2' -Hook
+        } else {
+            $result = Invoke-ApprovedFix $round $Maximum -Register
+        }
+        Assert-Equal 0 $result.exit "正常輪 $round 應通過：$($result.stdout) $($result.stderr)"
+    }
+    return (Set-ApprovedReview ($Maximum + 1))
+}
+
+function Start-ApprovedFixProcess([int]$Maximum) {
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'pwsh'
+    $psi.WorkingDirectory = (Get-Location).Path
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $prompt = Get-ApprovedFixPrompt ($Maximum + 1) 'R-1'
+    foreach ($arg in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ApprovedFixScript, '-SelfCheck', '-Register', '-Json',
+        '-Payload', $prompt, '-MaxReviewRounds', [string]$Maximum)) { $psi.ArgumentList.Add($arg) }
+    $process = [Diagnostics.Process]::Start($psi)
+    return @{
+        process = $process; stdout = $process.StandardOutput.ReadToEndAsync(); stderr = $process.StandardError.ReadToEndAsync()
+    }
+}
+
+function Set-ApprovedDispatchStatus($Receipt, [string]$Status, [string]$AttemptId = $Receipt.attempt_id) {
+    return Invoke-Script $ApprovedFixScript -Params @{
+        SelfCheck = $true; Json = $true; FeatureId = $ApprovedFeature; ReceiptId = $Receipt.receipt_id
+        AttemptId = $AttemptId; DispatchStatus = $Status; DispatchEvidence = 'event:synthetic-tool-receipt'
+    }
+}
+
+Describe-Suite 'handoff-lint / 額外修正輪授權與收據' {
+    It-Should '同檔不同 ID 不算卡住，連續對同一個 ID 修兩次才需要使用者裁定' {
+        Invoke-ApprovedFixTest {
+            Set-ApprovedReview 1 | Out-Null
+            Assert-Equal 0 (Invoke-ApprovedFix 1 5 -Register).exit
+            Set-ApprovedReview 2 | Out-Null
+            Assert-Equal 0 (Invoke-ApprovedFix 2 5 -Register).exit
+            Set-ApprovedReview 3 | Out-Null
+            $stuck = Invoke-ApprovedFix 3 5 -Register
+            Assert-Equal 2 $stuck.exit
+            Assert-Equal 'review-item-stuck' ($stuck.stdout | ConvertFrom-Json).violations[0].rule
+            $other = Invoke-ApprovedFix 3 5 -Issues 'R-2' -Register
+            Assert-Equal 0 $other.exit "同檔不同 ID 應可修：$($other.stdout)"
+        }
+    }
+
+    It-Should '已核准第 4 輪的預覽不登記，並行只能取得一筆收據，確認未派出後沿用原收據' {
+        Invoke-ApprovedFixTest {
+            $latest = Complete-ApprovedNormalRounds 3
+            Set-ApprovedExtra 4 $latest
+            $before = Get-FileHash -LiteralPath $ApprovedLedger
+            $preview = Invoke-ApprovedFix 4 3
+            Assert-Equal 0 $preview.exit "授權預覽應通過：$($preview.stdout)"
+            Assert-True (-not ($preview.stdout | ConvertFrom-Json).receipt)
+            Assert-Equal $before.Hash (Get-FileHash -LiteralPath $ApprovedLedger).Hash '預覽改動了正式紀錄'
+            $workers = @((Start-ApprovedFixProcess 3), (Start-ApprovedFixProcess 3))
+            try {
+                $attempts = @(foreach ($worker in $workers) {
+                    Assert-True ($worker.process.WaitForExit(30000)) '並行登記逾時'
+                    @{ exit = $worker.process.ExitCode; json = ($worker.stdout.GetAwaiter().GetResult() | ConvertFrom-Json) }
+                })
+                Assert-Equal '0,2' (($attempts.exit | Sort-Object) -join ',') '並行委派應只有一個成功'
+                $winner = $attempts | Where-Object exit -eq 0
+                $duplicate = $attempts | Where-Object exit -eq 2
+                $receipt = $winner.json.receipt
+                Assert-Equal 'review-extra-used' $duplicate.json.violations[0].rule
+                Assert-Equal $receipt.receipt_id $duplicate.json.receipt.receipt_id
+            } finally {
+                foreach ($worker in $workers) {
+                    if (-not $worker.process.HasExited) { $worker.process.Kill() }
+                    $worker.process.Dispose()
+                }
+            }
+            $source = Join-Path (Get-Location).Path 'src/App.ps1'
+            $priorContent = [IO.File]::ReadAllBytes($source)
+            try {
+                Set-Content -LiteralPath $source -Value '# 尚未重新審查' -Encoding utf8
+                $rewound = Invoke-ApprovedFix 1 3 -Register
+                Assert-Equal 2 $rewound.exit
+                Assert-Equal 'review-extra-used' ($rewound.stdout | ConvertFrom-Json).violations[0].rule
+            } finally { [IO.File]::WriteAllBytes($source, $priorContent) }
+            $badAttempt = Set-ApprovedDispatchStatus $receipt NotSent -AttemptId ('0' * 32)
+            Assert-Equal 2 $badAttempt.exit
+            Assert-Equal 2 (Invoke-ApprovedFix 4 3 -Register).exit '未知結果不可重派'
+            Assert-Equal 0 (Set-ApprovedDispatchStatus $receipt NotSent).exit
+            $new = Invoke-ApprovedFix 4 3 -Register
+            Assert-Equal 0 $new.exit
+            $retry = ($new.stdout | ConvertFrom-Json).receipt
+            Assert-Equal $receipt.receipt_id $retry.receipt_id '確認未送出後應沿用原收據'
+            Assert-True ($receipt.attempt_id -cne $retry.attempt_id)
+            Assert-Equal 2 (Set-ApprovedDispatchStatus $receipt Sent).exit '舊嘗試不得覆蓋新委派'
+            Assert-Equal 0 (Set-ApprovedDispatchStatus $retry Sent).exit
+            Assert-Equal 2 (Invoke-ApprovedFix 4 3 -Register).exit '已派出不得再用授權'
+            $ledger = Get-Content -LiteralPath $ApprovedLedger -Raw | ConvertFrom-Json
+            Assert-Equal 1 @($ledger.iterations.PSObject.Properties).Count
+            Assert-Equal 'not-sent,sent' ($ledger.iterations.'1'.extra.attempts.status -join ',')
+        }
+    }
+
+    It-Should '有效第 6 輪透過 hook 正式登記，錯審查、錯 ID、舊迭代或跳輪一律擋下' {
+        Invoke-ApprovedFixTest {
+            $first = Set-ApprovedReview 0
+            Set-ApprovedExtra 6 $first
+            $early = Invoke-ApprovedFix 6 5 -Register
+            Assert-Equal 2 $early.exit
+            Assert-Equal 'review-loop-not-exhausted' ($early.stdout | ConvertFrom-Json).violations[0].rule
+            $latest = Complete-ApprovedNormalRounds 5
+            $wrongVersion = Invoke-ApprovedFix 6 5 -Register
+            Assert-Equal 2 $wrongVersion.exit
+            Assert-Equal 'review-loop-exceeded' ($wrongVersion.stdout | ConvertFrom-Json).violations[0].rule
+            Set-ApprovedExtra 6 $latest -Iteration 2
+            Assert-Equal 2 (Invoke-ApprovedFix 6 5 -Register).exit
+            Set-ApprovedExtra 6 $latest
+            Assert-Equal 2 (Invoke-ApprovedFix 6 5 -Issues 'R-2' -Register).exit
+            Assert-Equal 2 (Invoke-ApprovedFix 7 5 -Register).exit
+            $hook = Invoke-ApprovedFix 6 5 -Hook
+            Assert-Equal 0 $hook.exit "第 6 輪 hook 未登記：$($hook.stderr)"
+            Assert-Match '額外輪次收據' (($hook.stdout | ConvertFrom-Json).hookSpecificOutput.additionalContext)
+            Assert-Equal 2 (Invoke-ApprovedFix 6 5 -Hook).exit
+            Add-Content -LiteralPath "$ApprovedDoc/spec.md" -Value "`n## 迭代 2`n新的使用者核准範圍。"
+            Invoke-ApprovedReview @{ Action = 'Approve'; Risk = 'general'; Scope = 'src/App.ps1' } | Out-Null
+            Set-ApprovedReview 7 | Out-Null
+            Assert-Equal 0 (Invoke-ApprovedFix 1 5 -Register).exit '新迭代可從正常第 1 輪起算'
+            $ledger = Get-Content -LiteralPath $ApprovedLedger -Raw | ConvertFrom-Json
+            Assert-True ([bool]$ledger.iterations.'1'.extra)
+            Assert-Equal 1 @($ledger.iterations.'2'.normal).Count
+        }
     }
 }

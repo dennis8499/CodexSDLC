@@ -76,6 +76,26 @@ Describe-Suite 'dlp-residual-scan / 偵測' {
 
 Describe-Suite 'dlp-gate / PostToolUse 短路' {
 
+    It-Should '掃描審查報告時保留舊快照，審查對帳由登記指令負責' {
+        $dir = 'bdd-docs/test-dlp-' + [guid]::NewGuid().ToString('N')
+        [void][IO.Directory]::CreateDirectory((Join-Path (Get-Location).Path "$dir/reviews"))
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText((Join-Path (Get-Location).Path "$dir/reviews/legacy.md"), '1. [必修] src/A.cs:1 —— 例外檢查不足', $utf8)
+        [IO.File]::WriteAllText((Join-Path (Get-Location).Path "$dir/review.md"), 'VERDICT: PASS', $utf8)
+        try {
+            $r = Invoke-Script $Gate -Stdin (New-CodexHookPayload -Command (New-CodexPatch -Update "$dir/review.md"))
+            Assert-Equal 0 $r.exit "stderr: $($r.stderr)"
+            Assert-Equal 'legacy.md' ((Get-ChildItem -LiteralPath "$dir/reviews" -File -Name) -join ',')
+        } finally {
+            $target = Get-Item -LiteralPath $dir
+            $docs = (Resolve-Path -LiteralPath 'bdd-docs').Path
+            if ($target.Parent.FullName -ne $docs -or ($target.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Unexpected DLP fixture cleanup path'
+            }
+            Remove-Item -LiteralPath $target.FullName -Recurse -Force
+        }
+    }
+
     It-Should 'payload 未提及 bdd-docs 路徑時靜默通過' {
         $r = Invoke-Script $Gate -Stdin '{"tool_input":{"path":"src/A.cs"}}'
         Assert-Equal 0 $r.exit

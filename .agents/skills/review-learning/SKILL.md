@@ -22,7 +22,7 @@ pwsh .codex/scripts/sdlc.ps1 learn -Json
 讀 `data.learn`：
 
 - `findings[]`：`feature`、`severity`（必修｜建議）、`location`、`file`、`problem`、`failure`（會怎麼壞）、`rounds`（同一需求裡出現在幾輪）。同一需求內已去重。
-- `features[]`：`snapshots` 是 0 的需求只剩最後一輪 —— 已經修掉的 [必修] 看不到，那幾個需求的「沒出現」不代表沒犯過。
+- `features[]`：查各需求的歷史來源。新版必修依需求內的 ID 去重。舊案可讀既有快照；只剩最後一輪的舊案，可能缺早期發現。
 - `guidelines.files`、`guidelines.ruleIds`：已經有的規範檔與規則 id。
 
 `counts.features` 小於 2 → 跟使用者說「需求還太少，看不出哪些是一再出現的」，列出現有的 [必修] 就停。

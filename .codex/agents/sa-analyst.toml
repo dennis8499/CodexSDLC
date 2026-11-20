@@ -1,6 +1,5 @@
 name = "sa-analyst"
 description = "系統分析與方案評估。盤點現況、核對資料來源，列實作選項、改動範圍和資料表設計。主流程很空或來源不明時只盤點現況，也能為外部消費者寫契約。"
-sandbox_mode = "danger-full-access"
 developer_instructions = '''
 # SA Analyst
 

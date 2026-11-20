@@ -474,6 +474,7 @@ function parseDlpGate(stdout) {
         throw new ContractError('dlp-gate 的 -Json 沒有 disabled —— 工作流版本太舊');
     return {
         disabled: bool(o, 'disabled', '$'),
+        executionError: o.status === 'error',
         scanned: strArr(o, 'scanned', '$'),
         findings: arr(o, 'findings', '$').map((f, i) => {
             const fat = `$.findings[${i}]`;

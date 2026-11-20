@@ -1,7 +1,6 @@
 # dlp-gate.ps1
 # PostToolUse 縱深防禦：對寫入 bdd-docs/** 的 artifact 執行殘留掃描。
-# 另外順手兩件不阻斷的事：寫心跳（Write-HookHeartbeat），以及替掃過、乾淨的 review.md 留一份快照（檔尾）。
-# 留快照之前還驗一件會阻斷的事：上一份 review.md 的每一項 [必修]，新的這份都要有交代（Get-UnaccountedMust）。
+# 審查完成及必修對帳由 review-check 管理。此 hook 負責掃描及更新心跳。
 #
 # 短路條件：存在 `bdd-docs/.dlp-disabled` 時整條掃描鏈路跳過。
 # 這是**專案層級**的宣告（v4.0.0 起；v3 是 run 層級，而 v4 沒有 run）。
@@ -14,7 +13,7 @@
 #
 # 另有 -Path／-Json 給手動執行與 VS Code extension 用（Problems 面板）。-Json 的 stdout 就是結果本身。
 #
-# Exit: 0 = 通過或已短路；2 = 偵測到殘留，或 review.md 有上一份的 [必修] 沒交代（阻斷）。
+# Exit: 0 = 通過或不適用／停用；2 = 偵測到殘留或掃描失敗。
 
 [CmdletBinding()]
 param(
@@ -22,8 +21,9 @@ param(
     [string]$Payload,
     [string[]]$Path,                                    # 直接指定檔案，跳過 payload 解析
     [string]$ScanScript = (Join-Path $PSScriptRoot 'dlp-residual-scan.ps1'),   # 跟這支放在一起（managed hooks 時不在專案裡）
-    [string]$DisableMarker = 'bdd-docs/.dlp-disabled',
-    [switch]$Json
+    [string]$DisableMarker,
+    [switch]$Json,
+    [string]$DocsRoot = 'bdd-docs'
 )
 
 # ---- 標準 I/O：被程式呼叫時一律 UTF-8 ----
@@ -134,11 +134,9 @@ function Write-HookHeartbeat([string]$eventName, [string]$name) {
 
 # 一律正規化成「相對 cwd、正斜線」—— hook 的 cwd 就是專案根。
 function ConvertTo-RelPath([string]$p) {
-    $n = $p.Trim() -replace '\\', '/'
-    $root = ((Get-Location).Path -replace '\\', '/').TrimEnd('/')
-    if ($n.StartsWith("$root/", [StringComparison]::OrdinalIgnoreCase)) { $n = $n.Substring($root.Length + 1) }
-    while ($n.StartsWith('./')) { $n = $n.Substring(2) }
-    return $n
+    $root = (Get-Location).Path
+    try { return [IO.Path]::GetRelativePath($root, [IO.Path]::GetFullPath($p.Trim(), $root)).Replace('\', '/') }
+    catch { return $null }
 }
 
 function Write-HookContext([string]$eventName, [string[]]$lines) {
@@ -147,11 +145,12 @@ function Write-HookContext([string]$eventName, [string[]]$lines) {
                               ConvertTo-Json -Compress -Depth 4))
 }
 
-function Write-Result([bool]$passed, [bool]$disabled, [string[]]$scanned, $findings) {
+function Write-Result([string]$status, [string[]]$scanned = @(), $findings = @()) {
     if (-not $Json) { return }
     [pscustomobject]@{
-        passed   = $passed
-        disabled = $disabled
+        passed   = $status -notin @('failed', 'error')
+        disabled = $status -eq 'disabled'
+        status   = $status
         scanned  = @($scanned)
         findings = @($findings)
     } | ConvertTo-Json -Depth 6 -Compress
@@ -160,126 +159,81 @@ function Write-Result([bool]$passed, [bool]$disabled, [string[]]$scanned, $findi
 $hook = [pscustomobject]@{ event = ''; paths = @() }
 if (-not $Path) {
     if (-not $Payload) { $Payload = Read-StdinUtf8 }
-    if (-not $Payload) { Write-Result $true $false @() @(); exit 0 }
+    if (-not $Payload) { Write-Result 'not-applicable'; exit 0 }
     $hook = Read-HookPayload $Payload
     Write-HookHeartbeat $hook.event 'dlp-gate'
     $Path = $hook.paths
 }
-if (-not (Test-Path $ScanScript)) { Write-Result $true $false @() @(); exit 0 }
 
 # 標記檔關掉時**每次都喊**（不阻斷，exit 仍是 0）。標記檔通常是某一次為了解卡建的，
 # 建完就留在那裡 —— 之後每一個需求都在沒有殘留掃描的情況下寫檔，而畫面上一切正常。
 # 靜默地「防護其實沒在生效」比擋錯更糟，這一行是唯一會提醒的東西。
-if (Test-Path $DisableMarker) {
+if (-not $DisableMarker) { $DisableMarker = Join-Path $DocsRoot '.dlp-disabled' }
+if (Test-Path -LiteralPath $DisableMarker -PathType Leaf) {
     $msg = "[Hook][DLP] 已被 $DisableMarker 關閉 —— 這次沒有掃任何檔。要恢復就刪掉那個標記檔。"
     [Console]::Error.WriteLine($msg)
     Write-HookContext $hook.event @($msg)
-    Write-Result $true $true @() @()
+    Write-Result 'disabled'
     exit 0
 }
 
+$docsPath = ConvertTo-RelPath $DocsRoot
+if (-not $docsPath) {
+    [Console]::Error.WriteLine('[Hook][DLP] 無法解析產出目錄。')
+    Write-Result 'error'
+    exit 2
+}
+$docsPrefix = $docsPath.TrimEnd('/') + '/'
 $targets = @($Path | ForEach-Object { ConvertTo-RelPath $_ } |
-             Where-Object { $_ -match '^bdd-docs/' } |
+             Where-Object { $_ -and $_.StartsWith($docsPrefix, [StringComparison]::OrdinalIgnoreCase) } |
              Sort-Object -Unique |
-             Where-Object { (Test-Path -LiteralPath $_) -and -not (Get-Item -LiteralPath $_).PSIsContainer })
+             Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+if (-not $targets.Count) { Write-Result 'not-applicable'; exit 0 }
 
-# 全部掃完才決定 exit —— 報第一個就停，同一次寫入的第二個檔要等下一輪才看得到。
-# 殘留掃描在同一個行程裡跑：它把 JSON 寫到管線、用 exit code 回報，接得起來。以前每個檔另起一個 pwsh，
-# 寫一次 spec.md 這支 gate 就要 3 秒多（一般 1.6 秒）—— 而 bdd-docs/ 是這支 gate 唯一會掃的地方。
+if (-not (Test-Path -LiteralPath $ScanScript -PathType Leaf)) {
+    [Console]::Error.WriteLine('[Hook][DLP] 找不到殘留掃描程式，請修復工作流工具後重跑。')
+    Write-Result 'error'
+    exit 2
+}
+
+# 同一次寫入有多個檔時，各檔都要有可核對的掃描結果。
 $scanFull = (Resolve-Path -LiteralPath $ScanScript).Path
+$scanned = @()
 $findings = @()
+$failedToScan = @()
 foreach ($p in $targets) {
-    $global:LASTEXITCODE = 0
-    $out = & $scanFull -Path $p
-    if ($LASTEXITCODE -eq 2) {
-        [Console]::Error.WriteLine("[Hook][DLP] Residual sensitive pattern in ${p}: $out")
-        $scan = $null
-        try { $scan = ($out | Out-String) | ConvertFrom-Json } catch { }
-        # 陣列一定要先放進變數：寫成 `categories = if (...) { @(...) }` 的話，if 敘述的輸出會把
-        # 單元素陣列攤平成一個物件，-Json 的讀者（extension）就收到 object 而不是 array。
-        $cats = @(); $refs = @()
-        if ($scan) { $cats = @($scan.categories); $refs = @($scan.line_refs) }
+    try {
+        $global:LASTEXITCODE = -1
+        $out = & $scanFull -Path $p 2>$null
+        $scanExit = $LASTEXITCODE
+        $scan = ($out | Out-String) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+        if ($scan -isnot [pscustomobject] -or $scan.passed -isnot [bool] -or
+            ($scan.scanned_chars -isnot [int] -and $scan.scanned_chars -isnot [long]) -or $scan.scanned_chars -lt 0 -or
+            ($scan.residual_count -isnot [int] -and $scan.residual_count -isnot [long]) -or $scan.residual_count -lt 0 -or
+            $scan.passed -ne ($scan.residual_count -eq 0) -or $scan.categories -isnot [array] -or
+            $scanExit -ne $(if ($scan.passed) { 0 } else { 2 })) {
+            $failedToScan += $p
+            continue
+        }
+    } catch {
+        $failedToScan += $p
+        continue
+    }
+
+    $scanned += $p
+    if (-not $scan.passed) {
+        $cats = @($scan.categories)
+        $refs = @($scan.line_refs)
         $findings += [pscustomobject]@{ file = $p; categories = $cats; lines = $refs }
+        [Console]::Error.WriteLine("[Hook][DLP] Residual sensitive pattern in $($p)：$($cats.type -join '、')（行 $($refs -join ',')）")
     }
 }
 
-# ---- 上一份的 [必修] 不能無聲消失 ----
-# reviewer 每一輪整份覆寫 review.md。上一輪的某項 [必修] 這一輪沒再出現，分不出是修好了、被接受了，還是忘了看 ——
-# 而 PASS 就是從那裡漏出去的。借 REA 的 closure history：未完成的數量每少一項，都要指名是哪一項、憑什麼。
-# 所以上一份（最新的快照）的每一項 [必修]，新的這份要嘛照樣列成 [必修]（同一個檔），要嘛寫進「## 上一輪必修的交代」：
-#   - {檔:行} —— {問題}：已修 —— {證據}       或       ：接受不修 —— {理由}
-# 對應只看檔（行號與措辭每輪都會變）：同一個檔，上一份有幾項，新的這份「仍是必修」加「有交代」就要有幾項。
-# 解析格式跟 sdlc.ps1 learn 的 Read-ReviewFindings 同一條（reviewer.toml 規定的那一行）。
-function Get-MustItems([string]$text) {
-    $out = @()
-    foreach ($line in ($text -replace "`r`n", "`n") -split "`n") {
-        $m = [regex]::Match($line, '^\s*\d+\.\s*\[必修\]\s*(.+?)\s+——\s+(.+?)\s*$')
-        if (-not $m.Success) { continue }
-        $loc = $m.Groups[1].Value.Trim().Trim('`', '{', '}')
-        $out += [pscustomobject]@{ location = $loc; file = ($loc -replace '(:\d+(-\d+)?)+$', ''); problem = $m.Groups[2].Value }
-    }
-    return $out
+if ($failedToScan.Count) {
+    [Console]::Error.WriteLine("[Hook][DLP] 殘留掃描執行錯誤，請確認工具及檔案可讀後重跑：$($failedToScan -join '、')")
+    Write-Result 'error' $scanned $findings
+    exit 2
 }
-
-function Get-AccountedFiles([string]$text) {
-    $out = @(); $in = $false
-    foreach ($line in ($text -replace "`r`n", "`n") -split "`n") {
-        if ($line -match '^##\s') { $in = $line -match '^##\s*上一輪必修的交代'; continue }
-        if (-not $in) { continue }
-        $m = [regex]::Match($line, '^\s*[-*]\s*(.+?)\s+——\s+.+?[:：]\s*(已修|接受不修)\s*——\s*\S')
-        if ($m.Success) { $out += ($m.Groups[1].Value.Trim().Trim('`', '{', '}') -replace '(:\d+(-\d+)?)+$', '') }
-    }
-    return $out
-}
-
-function Get-UnaccountedMust([string]$prevText, [string]$newText) {
-    $prev = @(Get-MustItems $prevText)
-    if (-not $prev.Count) { return @() }
-    $open = @(Get-MustItems $newText | ForEach-Object { $_.file })
-    $done = @(Get-AccountedFiles $newText)
-    $missing = @()
-    foreach ($g in ($prev | Group-Object file)) {
-        $have = @($open | Where-Object { $_ -eq $g.Name }).Count + @($done | Where-Object { $_ -eq $g.Name }).Count
-        if ($have -lt $g.Count) { $missing += $g.Group }
-    }
-    return $missing
-}
-
-# ---- 每一輪審核留一份快照 ----
-# reviewer 每一輪都整份覆寫 review.md（修正輪的 implementer 只該看最新那份）。代價是 PASS 之後，前幾輪抓到、
-# 已經修掉的 [必修] 在磁碟上一項都不剩 —— 而「同一類錯一再被抓」只看得到那些（sdlc.ps1 learn 讀這些快照）。
-# 放在這支，是因為它是唯一只看 bdd-docs/ 寫入的 hook；另開一條 hook 每個 patch 多付一次 pwsh 啟動，還要重新信任。
-# 掃出殘留的不留：那一份照 runbook 要刪掉，快照會把它保存下來（DLP 被關掉時上面就 exit 了，理由相同）。
-# 跟最新一份快照逐字相同就不留 —— 一輪審核常是好幾個 patch。只在 hook 在叫時做：手動 -Path 掃不算一輪。
-# 上一份的 [必修] 沒交代的也不留：留了，下一次寫入就拿它當「上一份」，沒交代的那幾項從此脫鉤。
-$unaccounted = @()
-if ($hook.event) {
-    foreach ($p in $targets) {
-        $m = [regex]::Match($p, '^bdd-docs/([^/.][^/]*)/review\.md$')
-        if (-not $m.Success -or @($findings | Where-Object file -eq $p).Count) { continue }
-        try {
-            $text = [IO.File]::ReadAllText((Join-Path (Get-Location).Path $p))
-            $dir = Join-Path (Get-Location).Path "bdd-docs/$($m.Groups[1].Value)/reviews"
-            $last = @(Get-ChildItem -LiteralPath $dir -Filter '*.md' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc, Name | Select-Object -Last 1)
-            if ($last.Count -and [IO.File]::ReadAllText($last[0].FullName) -eq $text) { continue }
-            if ($last.Count) {
-                $miss = @(Get-UnaccountedMust ([IO.File]::ReadAllText($last[0].FullName)) $text)
-                if ($miss.Count) {
-                    $unaccounted += $miss
-                    [Console]::Error.WriteLine("[Hook][review] $p：上一份 review.md 的這幾項 [必修] 在新的這份裡沒有交代 —— 沒修好就照樣列成 [必修]；修好了或接受不修，寫進「## 上一輪必修的交代」，一項一行：- {檔:行} —— {問題}：已修 —— {證據：測試名稱或 檔:行}（或：接受不修 —— {理由}）")
-                    foreach ($x in $miss) { [Console]::Error.WriteLine("  - $($x.location) —— $($x.problem)") }
-                    continue
-                }
-            }
-            [void][IO.Directory]::CreateDirectory($dir)
-            $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
-            $dest = Join-Path $dir "$stamp.md"; $n = 1
-            while (Test-Path -LiteralPath $dest) { $n++; $dest = Join-Path $dir "$stamp-$n.md" }
-            [IO.File]::WriteAllText($dest, $text, [Text.UTF8Encoding]::new($false))
-        } catch { }
-    }
-}
-
-Write-Result ($findings.Count -eq 0) $false $targets $findings
-if ($findings.Count -gt 0 -or $unaccounted.Count -gt 0) { exit 2 }
+if ($findings.Count) { Write-Result 'failed' $scanned $findings; exit 2 }
+Write-Result 'passed' $scanned
 exit 0

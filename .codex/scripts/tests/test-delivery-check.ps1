@@ -3,7 +3,8 @@
 # 漏寫一項殘留風險、最後一輪修正之後沒重跑測試、審核 FAIL 卻當成可以交付，每一種都要有一條必紅的案例。
 
 $DcScript = (Resolve-Path '.codex/scripts/delivery-check.ps1').Path
-$DcRoot   = Join-Path ([IO.Path]::GetTempPath()) 'codex-delivery-check-tests'
+$DcReviewScript = Join-Path (Split-Path $DcScript -Parent) 'review-check.ps1'
+$DcRoot = Join-Path ([IO.Path]::GetTempPath()) ('codex-delivery-check-tests-' + [guid]::NewGuid().ToString('N'))
 $DcUtf8   = [Text.UTF8Encoding]::new($false)
 
 $DcSpecBody = @'
@@ -66,7 +67,7 @@ $DcReviewFail = @'
 VERDICT: FAIL
 
 ## 發現
-1. [必修] src/Orders/CancelService.cs:40 —— 已出貨的訂單沒有被擋下
+1. [必修] [R-1] src/Orders/CancelService.cs:40 —— 已出貨的訂單沒有被擋下
    會怎麼壞：訂單 1002（已出貨）取消後狀態變成「已取消」
 '@
 
@@ -86,13 +87,74 @@ function Write-DcFile([string]$rel, [string]$text) {
     [IO.File]::WriteAllText($p, $text, $DcUtf8)
 }
 
+function Invoke-DcReview([hashtable]$parameters) {
+    Push-Location $DcRoot
+    try {
+        $raw = & $DcReviewScript -FeatureId 'cancel-order' -Json @parameters
+        $reviewExit = $LASTEXITCODE
+        return [pscustomobject]@{ exit = $reviewExit; json = ($raw | Out-String | ConvertFrom-Json) }
+    } finally { Pop-Location }
+}
+
+function Register-DcReview([string]$report, [string]$mode = 'code', [string[]]$scope = @()) {
+    if ($mode -eq 'code') {
+        if (-not $scope.Count) {
+            $scope = @('src/Orders/CancelService.cs')
+            if (Test-Path -LiteralPath (Join-Path $DcRoot 'tests/Features/CancelOrder.feature')) {
+                $scope += 'tests/Features/CancelOrder.feature'
+            }
+        }
+        $approval = Invoke-DcReview @{ Action = 'Approve'; Risk = 'general'; Scope = $scope }
+        Assert-Equal 0 $approval.exit "approve: $($approval.json | ConvertTo-Json -Compress)"
+    }
+    $start = Invoke-DcReview @{ Action = 'Start'; Mode = $mode }
+    Assert-Equal 0 $start.exit "start: $($start.json | ConvertTo-Json -Compress)"
+    $script:DcReviewVersion = $start.json.review_id
+    Assert-True ([bool]$script:DcReviewVersion)
+    $name = if ($mode -eq 'spec') { 'spec-review.md' } else { 'review.md' }
+    $parts = $report -split '\r?\n', 2
+    $newline = [string][char]10
+    Write-DcFile "bdd-docs/cancel-order/$name" ($parts[0] + $newline + "REVIEW-ID: $script:DcReviewVersion" + $newline + [string]$parts[1])
+    return (Invoke-DcReview @{ Action = 'Complete'; ReviewId = $script:DcReviewVersion })
+}
+
+function Use-DcDeliveryTools([string[]]$omit = @(), [hashtable]$stubs = @{}) {
+    $source = Split-Path $DcScript -Parent
+    $fixture = Join-Path $DcRoot '.codex/scripts'
+    [void][IO.Directory]::CreateDirectory((Join-Path $fixture 'lib'))
+    foreach ($file in @('delivery-check.ps1', 'dlp-gate.ps1', 'dlp-residual-scan.ps1', 'guideline-gate.ps1')) {
+        if ($file -in $omit) { continue }
+        if ($stubs.ContainsKey($file)) {
+            Write-DcFile ".codex/scripts/$file" $stubs[$file]
+        } else {
+            Copy-Item -LiteralPath (Join-Path $source $file) -Destination $fixture
+        }
+    }
+    foreach ($file in Get-ChildItem -LiteralPath (Join-Path $source 'lib') -Filter '*.ps1' -File) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $fixture 'lib')
+    }
+    $script:DcDeliveryPath = Join-Path $fixture 'delivery-check.ps1'
+}
+
+function Remove-DcProject {
+    $path = Get-Item -LiteralPath $DcRoot -ErrorAction SilentlyContinue
+    if (-not $path) { return }
+    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
+    if ($path.Parent.FullName -ne $temp -or $path.Name -notmatch '^codex-delivery-check-tests-[a-f0-9]{32}$' -or
+        ($path.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Unexpected delivery fixture cleanup path'
+    }
+    Remove-Item -LiteralPath $path.FullName -Recurse -Force
+}
+
 # 一個交付得出去的專案：spec（含交付一節）、PASS 的審核、.feature、src、已 commit，結果檔比所有改過的檔新。
 function New-DcProject([string]$spec = ($DcSpecBody + $DcDelivery), [string]$feature = $DcFeature, [string]$review = $DcReviewPass,
                        [string[]]$tests = @('未出貨的訂單可以取消', '已出貨的訂單不能取消'), [switch]$NoGit) {
-    Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-DcProject
+    $script:DcDeliveryPath = $DcScript
+    $script:DcReviewVersion = $null
     Write-DcFile 'bdd-docs/cancel-order/spec.md' $spec
     if ($feature) { Write-DcFile 'tests/Features/CancelOrder.feature' $feature }
-    if ($review)  { Write-DcFile 'bdd-docs/cancel-order/review.md' $review }
     Write-DcFile 'src/Orders/CancelService.cs' 'class CancelService {}'
     if (-not $NoGit) {
         Push-Location $DcRoot
@@ -100,6 +162,10 @@ function New-DcProject([string]$spec = ($DcSpecBody + $DcDelivery), [string]$fea
             git init -q 2>$null; git add -A 2>$null
             git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m base 2>$null
         } finally { Pop-Location }
+    }
+    if ($review) {
+        $complete = Register-DcReview $review
+        Assert-Equal 0 $complete.exit "complete: $($complete.json | ConvertTo-Json -Compress)"
     }
     Write-DcFile 'TestResults/run.trx' (New-DcTrx $tests)
 }
@@ -110,7 +176,7 @@ function Invoke-Dc([hashtable]$extra = @{}, [switch]$NoResults) {
         $p = @{ FeatureId = 'cancel-order'; Json = $true }
         if (-not $NoResults) { $p['TestResults'] = 'TestResults/run.trx' }
         foreach ($k in $extra.Keys) { $p[$k] = $extra[$k] }
-        $r = Invoke-Script $DcScript -Params $p
+        $r = Invoke-Script $script:DcDeliveryPath -Params $p
         $r | Add-Member -NotePropertyName json -NotePropertyValue $(try { $r.stdout | ConvertFrom-Json } catch { $null })
         $r | Add-Member -NotePropertyName codes -NotePropertyValue @($r.json.problems | ForEach-Object { $_.code })
         return $r
@@ -126,7 +192,7 @@ Describe-Suite 'delivery-check / 交付得出去的那一份要綠' {
             Assert-Equal 0 $r.exit "stdout: $($r.stdout) stderr: $($r.stderr)"
             Assert-Equal 'PASS' $r.json.review.verdict
             Assert-True $r.json.gherkin.passed
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '不帶 -Json：一行 OK，附「外部來源只用替身驗過」的提醒（那一項這支看不到）' {
@@ -137,7 +203,7 @@ Describe-Suite 'delivery-check / 交付得出去的那一份要綠' {
             Assert-Equal 0 $r.exit "stderr: $($r.stderr)"
             Assert-Match '\[delivery-check\] OK' $r.stdout
             Assert-Match '替身' $r.stdout
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '沒有 .feature 的需求（bug 修復、沒有行為變更）不要求結果檔' {
@@ -146,7 +212,7 @@ Describe-Suite 'delivery-check / 交付得出去的那一份要綠' {
             $r = Invoke-Dc -NoResults
             Assert-Equal 0 $r.exit "stdout: $($r.stdout)"
             Assert-True (-not $r.json.gherkin.applicable)
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '不是 git repo 也找得到 .feature' {
@@ -155,7 +221,7 @@ Describe-Suite 'delivery-check / 交付得出去的那一份要綠' {
             $r = Invoke-Dc
             Assert-Equal 0 $r.exit "stdout: $($r.stdout)"
             Assert-Equal 1 @($r.json.gherkin.features).Count
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 }
 
@@ -167,7 +233,7 @@ Describe-Suite 'delivery-check / 交付一節' {
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
             Assert-True ('no-delivery-section' -in $r.codes) "codes: $($r.codes -join ',')"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '最後那一節沒寫殘留風險 → 紅（「無」也要寫出來）' {
@@ -176,7 +242,7 @@ Describe-Suite 'delivery-check / 交付一節' {
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
             Assert-True ('delivery-no-risk-line' -in $r.codes) "codes: $($r.codes -join ',')"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '@manual 的 scenario 沒寫進交付 → 紅；寫了「待人工驗證」→ 綠' {
@@ -190,21 +256,22 @@ Describe-Suite 'delivery-check / 交付一節' {
             Write-DcFile 'bdd-docs/cancel-order/spec.md' ($DcSpecBody + ($DcDelivery -replace '殘留風險：無', "殘留風險：`n  - 待人工驗證：已出貨的訂單不能取消"))
             $r = Invoke-Dc
             Assert-Equal 0 $r.exit "寫了還是紅；stdout: $($r.stdout)"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
-    It-Should '早幾輪「接受不修」的必修只留在快照裡，也要寫進交付' {
-        # 「上一輪必修的交代」只涵蓋上一輪：第 1 輪接受不修的，到第 3 輪的 review.md 已經看不到了
-        New-DcProject
+    It-Should '舊快照可保留，進行中需求須重新登記程式碼審查' {
+        New-DcProject -review ''
         try {
-            Write-DcFile 'bdd-docs/cancel-order/reviews/20261029-010000.md' ($DcReviewFail + "`n## 上一輪必修的交代`n- src/Orders/Refund.cs:8 —— 退款金額四捨五入：接受不修 —— 使用者說月底統一調帳`n")
+            $legacy = $DcReviewFail -replace '\[R-1\] ', ''
+            Write-DcFile 'bdd-docs/cancel-order/review.md' $legacy
+            Write-DcFile 'bdd-docs/cancel-order/reviews/20261029-010000.md' $legacy
             $r = Invoke-Dc
-            Assert-Equal 2 $r.exit "快照裡接受不修的沒列也過了；stdout: $($r.stdout)"
-            Assert-Match 'Refund\.cs' (@($r.json.delivery.missing) -join ' ')
-
-            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($DcSpecBody + ($DcDelivery -replace '殘留風險：無', '殘留風險：Refund.cs:8 退款四捨五入接受不修（月底調帳）'))
-            Assert-Equal 0 (Invoke-Dc).exit '寫了檔名還是紅'
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            Assert-Equal 2 $r.exit
+            Assert-True ('review-evidence-required' -in $r.codes)
+            Assert-Equal 0 (Register-DcReview $DcReviewPass).exit
+            Assert-Equal 0 (Invoke-Dc).exit
+            Assert-True (Test-Path -LiteralPath (Join-Path $DcRoot 'bdd-docs/cancel-order/reviews/20261029-010000.md'))
+        } finally { Remove-DcProject }
     }
 
     It-Should '前幾次迭代的交付已經列過的，不必再列一次' {
@@ -213,20 +280,21 @@ Describe-Suite 'delivery-check / 交付一節' {
         try {
             $r = Invoke-Dc @{ Json = $true }
             Assert-True ('delivery-missing-risk' -notin $r.codes) "前一次交付列過的又被要求一次；codes: $($r.codes -join ',')"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
-    It-Should '要列的項目很多時，收據有界：只列前 5 項，其餘給數量' {
-        New-DcProject
+    It-Should '八項未修必修的收據列前五項和其餘數量' {
+        $lf = [string][char]10
+        $lines = (1..8 | ForEach-Object { "$_. [必修] [R-$_] src/Orders/CancelService.cs:$_ —— 問題 $_" }) -join $lf
+        New-DcProject -review ("VERDICT: FAIL" + $lf + '## 發現' + $lf + $lines)
         try {
-            $lines = (1..8 | ForEach-Object { "- src/M$_.cs:1 —— 問題 $_：接受不修 —— 理由 $_" }) -join "`n"
-            Write-DcFile 'bdd-docs/cancel-order/review.md' ($DcReviewPass + "`n## 上一輪必修的交代`n$lines`n")
             $r = Invoke-Dc
+            Assert-Equal 2 $r.exit
             $p = @($r.json.problems | Where-Object code -eq 'delivery-missing-risk')[0]
             Assert-Equal 5 @($p.items).Count
             Assert-Equal 3 $p.omitted
-            Assert-Equal 8 @($r.json.delivery.missing).Count 'JSON 的 missing 是完整清單'
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            Assert-Equal 8 @($r.json.delivery.missing).Count
+        } finally { Remove-DcProject }
     }
 }
 
@@ -238,30 +306,100 @@ Describe-Suite 'delivery-check / 審核' {
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
             Assert-True ('no-review' -in $r.codes)
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
-    It-Should '審核 FAIL（使用者接受了這一版）：每一項必修沒寫進交付 → 紅；寫了 → 綠' {
-        New-DcProject -review $DcReviewFail
+    It-Should '同檔兩項必修各列 ID，前次交付與本次單項決定都擋住' {
+        $lf = [string][char]10
+        $noFeatureSpec = '# cancel-order' + $lf
+        $sameFile = $DcReviewFail + $lf + '2. [必修] [R-2] src/Orders/CancelService.cs:21 —— 取消按鈕未停用'
+        New-DcProject -spec ($noFeatureSpec + $DcDelivery) -feature '' -review $sameFile
         try {
-            $r = Invoke-Dc
-            Assert-Equal 2 $r.exit 'FAIL 的必修沒列進殘留風險就放行了'
-            Assert-Match 'CancelService\.cs:40' (@($r.json.delivery.missing) -join ' ')
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-Equal 2 @($r.json.delivery.missing).Count
+            Assert-Match 'R-1' ($r.json.delivery.missing -join ' ')
+            Assert-Match 'R-2' ($r.json.delivery.missing -join ' ')
 
-            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($DcSpecBody + ($DcDelivery -replace '殘留風險：無', '殘留風險：未修 src/Orders/CancelService.cs:40 已出貨的沒被擋下（使用者接受這一版）'))
-            $r = Invoke-Dc
+            $prior = @'
+
+## 交付 —— 2026-10-01
+- 殘留風險：舊的 CancelService.cs 問題
+- [R-1] 上次的決定
+
+'@
+            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($noFeatureSpec + $prior + $DcDelivery)
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-Equal 2 @($r.json.delivery.missing).Count
+
+            $version = $script:DcReviewVersion
+            $risk = @"
+
+## 風險決議
+
+- accept-risk: $version R-1 | 決議 A，接受已知風險
+
+## 交付 —— 2026-10-29
+
+- review-version: $version
+- 殘留風險：
+  - [R-1] 使用者接受風險 A
+"@
+            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($noFeatureSpec + $risk)
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-Equal 1 @($r.json.delivery.missing).Count
+            Assert-Match 'R-2' $r.json.delivery.missing[0]
+
+            $accepted = $risk.Replace('## 交付', "- accept-risk: $version R-2 | 決議 B，接受已知風險" + $lf + $lf + '## 交付')
+            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($noFeatureSpec + $accepted + $lf + '  - [R-2] 使用者接受風險 B')
+            $r = Invoke-Dc -NoResults
             Assert-Equal 0 $r.exit "stdout: $($r.stdout)"
             Assert-Equal 'FAIL' $r.json.review.verdict
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            Assert-Equal $version $r.json.review.version
+        } finally { Remove-DcProject }
     }
 
-    It-Should 'FAIL 卻解析不到任何 [必修] → 紅（不能當成「接受了」）' {
-        New-DcProject -review "VERDICT: FAIL`n`n## 發現`n- 必修：CancelService 有問題`n"
+    It-Should '規格審查 PASS 仍須有當前程式碼審查' {
+        New-DcProject -review ''
         try {
+            Assert-Equal 0 (Register-DcReview $DcReviewPass 'spec').exit
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
-            Assert-True ('review-fail-without-must' -in $r.codes)
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            Assert-True (('no-review' -in $r.codes) -or ('review-evidence-required' -in $r.codes))
+        } finally { Remove-DcProject }
+    }
+
+    It-Should '無 feature 時，追加交付保留審查，改受審程式則阻擋' {
+        $body = '# cancel-order' + [string][char]10
+        New-DcProject -spec ($body + $DcDelivery) -feature ''
+        try {
+            Write-DcFile 'bdd-docs/cancel-order/spec.md' ($body + $DcDelivery + [string][char]10 + '- 已補交付說明')
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 0 $r.exit "stdout: $($r.stdout)"
+            Assert-Equal $script:DcReviewVersion $r.json.review.version
+
+            Write-DcFile 'src/Orders/CancelService.cs' 'class CancelService { bool CanCancel = true; }'
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-True ('review-stale' -in $r.codes) $r.stdout
+            Assert-True (-not $r.json.gherkin.applicable)
+        } finally { Remove-DcProject }
+    }
+
+    It-Should 'PASS 留有必修或 FAIL 缺必修時，完成審查與交付都擋住' {
+        foreach ($report in @($DcReviewFail.Replace('VERDICT: FAIL', 'VERDICT: PASS'), 'VERDICT: FAIL')) {
+            New-DcProject -review ''
+            try {
+                $complete = Register-DcReview $report
+                Assert-Equal 2 $complete.exit "complete: $($complete.json | ConvertTo-Json -Compress)"
+                $r = Invoke-Dc
+                Assert-Equal 2 $r.exit
+                Assert-True (-not $r.json.passed)
+                Assert-True (@($r.codes | Where-Object { $_ -match 'review' }).Count -gt 0)
+            } finally { Remove-DcProject }
+        }
     }
 }
 
@@ -273,7 +411,7 @@ Describe-Suite 'delivery-check / 驗收條件' {
             $r = Invoke-Dc -NoResults
             Assert-Equal 2 $r.exit
             Assert-True ('no-test-results' -in $r.codes)
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '最後一輪修正之後沒重跑測試（結果檔比改過的檔舊）→ 紅' {
@@ -285,7 +423,7 @@ Describe-Suite 'delivery-check / 驗收條件' {
             Assert-Equal 2 $r.exit 'implementer 當時的綠燈被當成現在的'
             Assert-True ('gherkin' -in $r.codes)
             Assert-Match '結果檔比這些改過的檔舊' (@(@($r.json.problems | Where-Object code -eq 'gherkin')[0].items) -join ' ')
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '有一條 scenario 沒有測試 → 紅' {
@@ -294,7 +432,7 @@ Describe-Suite 'delivery-check / 驗收條件' {
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
             Assert-Match '找不到這條 scenario 的測試：已出貨的訂單不能取消' (@(@($r.json.problems | Where-Object code -eq 'gherkin')[0].items) -join ' ')
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should 'spec 有 Gherkin、repo 裡卻找不到那個 feature-id 的 .feature → 紅' {
@@ -303,7 +441,7 @@ Describe-Suite 'delivery-check / 驗收條件' {
             $r = Invoke-Dc
             Assert-Equal 2 $r.exit
             Assert-True ('feature-not-found' -in $r.codes) "codes: $($r.codes -join ',')"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '給的結果檔不存在 → 紅，不是當成沒給' {
@@ -312,7 +450,7 @@ Describe-Suite 'delivery-check / 驗收條件' {
             $r = Invoke-Dc @{ TestResults = 'TestResults/nope.trx' }
             Assert-Equal 2 $r.exit
             Assert-True ('test-results-missing' -in $r.codes)
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 }
 
@@ -323,7 +461,7 @@ Describe-Suite 'delivery-check / 輸入錯誤' {
         try {
             Assert-Equal 1 (Invoke-Dc @{ FeatureId = '../cancel-order' }).exit
             Assert-Equal 1 (Invoke-Dc @{ FeatureId = 'no-such-feature' }).exit
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 }
 
@@ -331,20 +469,21 @@ Describe-Suite 'delivery-check / 前後端分成兩個 repo、工作流裝在外
 
     It-Should '.feature 在巢狀 repo（workspace/frontend）裡 → 找得到，照樣綠' {
         # 根目錄的 git ls-files 不會走進巢狀 repo：以前這裡永遠是 feature-not-found，⑥ 交不出去。
-        New-DcProject -NoGit
-        Remove-Item (Join-Path $DcRoot 'tests') -Recurse -Force
+        New-DcProject -NoGit -review ''
+        Remove-Item -LiteralPath (Join-Path $DcRoot 'tests/Features/CancelOrder.feature')
         Write-DcFile 'frontend/tests/Features/CancelOrder.feature' $DcFeature
         # 巢狀的先建：反過來的話，根目錄的 repo 會把 frontend/ 的檔當成自己的追蹤進去。
         foreach ($d in @((Join-Path $DcRoot 'frontend'), $DcRoot)) {
             git -C $d init -q 2>$null; git -C $d add -A 2>$null
             git -C $d -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m base 2>$null
         }
+        Assert-Equal 0 (Register-DcReview $DcReviewPass -scope @('src/Orders/CancelService.cs', 'frontend/tests/Features/CancelOrder.feature')).exit
         Write-DcFile 'TestResults/run.trx' (New-DcTrx @('未出貨的訂單可以取消', '已出貨的訂單不能取消'))
         try {
             $r = Invoke-Dc
             Assert-True ('feature-not-found' -notin $r.codes) "巢狀 repo 裡的 .feature 沒找到：$($r.stdout)"
             Assert-Equal 0 $r.exit "stdout: $($r.stdout)"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 }
 
@@ -363,7 +502,7 @@ Describe-Suite 'delivery-check / 寫檔時那兩道 gate 交付前再跑一次�
             Assert-Match 'current-state\.md' $items
             Assert-True ($items -notmatch 'db01') "收據把敏感值本身印出來了：$items"
             Assert-Equal 'failed' $r.json.gates.dlp
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '這次改過的檔違反 block 規則 → 紅；沒改過的舊檔裡的違規不算' {
@@ -384,7 +523,7 @@ Describe-Suite 'delivery-check / 寫檔時那兩道 gate 交付前再跑一次�
             Remove-Item (Join-Path $DcRoot 'db/New.sql')
             $r = Invoke-Dc
             Assert-Equal 0 $r.exit "只剩舊檔的違規時應該綠：$($r.stdout)"
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '前後端兩個 repo：巢狀 repo 裡改過的檔也掃' {
@@ -399,7 +538,7 @@ Describe-Suite 'delivery-check / 寫檔時那兩道 gate 交付前再跑一次�
             $r = Invoke-Dc
             Assert-True ('guideline-block' -in $r.codes) "巢狀 repo 的改動沒被掃到：$($r.stdout)"
             Assert-Match 'backend/db/New\.sql' (@(@($r.json.problems | Where-Object code -eq 'guideline-block')[0].items) -join ' ')
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 
     It-Should '乾淨的時候 OK 那一行講兩道 gate 的結果（不是 git 時講明規範沒掃）' {
@@ -410,7 +549,79 @@ Describe-Suite 'delivery-check / 寫檔時那兩道 gate 交付前再跑一次�
             Assert-Equal 0 $r.exit "stderr: $($r.stderr)"
             Assert-Match '殘留掃描：通過' $r.stdout
             Assert-Match '規範：不是 git' $r.stdout
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
+    }
+
+    It-Should '啟用的殘留掃描程式缺失，文字和 JSON 都判定阻擋' {
+        New-DcProject -spec ('# cancel-order' + [string][char]10 + $DcDelivery) -feature ''
+        try {
+            Use-DcDeliveryTools -omit @('dlp-residual-scan.ps1')
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-True (-not $r.json.passed)
+            Assert-Equal 'error' $r.json.gates.dlp
+            Assert-True ('dlp-check-error' -in $r.codes)
+
+            $r = Invoke-Dc @{ Json = $false } -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-Match '殘留掃描：執行錯誤' $r.stderr
+            Assert-True ($r.stdout -notmatch '\[delivery-check\] OK')
+        } finally { Remove-DcProject }
+    }
+
+    It-Should '設定停用掃描和檢查時可以交付，並回報 disabled' {
+        New-DcProject -spec ('# cancel-order' + [string][char]10 + $DcDelivery) -feature ''
+        try {
+            Use-DcDeliveryTools -omit @('dlp-residual-scan.ps1', 'guideline-gate.ps1')
+            Write-DcFile 'bdd-docs/.dlp-disabled' ''
+            Write-DcFile 'guidelines/.gate-disabled' ''
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 0 $r.exit "stdout: $($r.stdout) stderr: $($r.stderr)"
+            Assert-Equal 'disabled' $r.json.gates.dlp
+            Assert-Equal 'disabled' $r.json.gates.guideline
+        } finally { Remove-DcProject }
+    }
+
+    It-Should '掃描回傳空白、破損 JSON 或缺欄位時會阻擋' {
+        $lf = [string][char]10
+        $cases = @(
+            @{ name = 'dlp-residual-scan.ps1'; gate = 'dlp'; body = 'param([string]$Path)' + $lf + 'exit 0' },
+            @{ name = 'dlp-residual-scan.ps1'; gate = 'dlp'; body = 'param([string]$Path)' + $lf + "Write-Output '{'" + $lf + 'exit 0' },
+            @{ name = 'guideline-gate.ps1'; gate = 'guideline'; body = 'param($Path, [switch]$Strict, [switch]$Json, $MaxReport)' + $lf + 'Write-Output ''{"passed":true}''' + $lf + 'exit 0' }
+        )
+        foreach ($case in $cases) {
+            New-DcProject -spec ('# cancel-order' + $lf + $DcDelivery) -feature ''
+            try {
+                Write-DcFile 'db/New.sql' 'SELECT 2'
+                Write-DcFile 'guidelines/rules.json' '{"rules":[{"id":"test-rule","pattern":"DROP"}]}'
+                $stubs = @{}
+                $stubs[$case.name] = $case.body
+                Use-DcDeliveryTools -stubs $stubs
+                $r = Invoke-Dc -NoResults
+                Assert-Equal 2 $r.exit
+                Assert-Equal 'error' $r.json.gates.($case.gate)
+                Assert-True ("$($case.gate)-check-error" -in $r.codes)
+            } finally { Remove-DcProject }
+        }
+    }
+
+    It-Should '啟用的規則檔載入失敗和未設定規則分別回報 error 和 not-applicable' {
+        New-DcProject -spec ('# cancel-order' + [string][char]10 + $DcDelivery) -feature ''
+        try {
+            Write-DcFile 'db/New.sql' 'SELECT 2'
+            Use-DcDeliveryTools -omit @('guideline-gate.ps1')
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 0 $r.exit "stdout: $($r.stdout) stderr: $($r.stderr)"
+            Assert-Equal 'not-applicable' $r.json.gates.guideline
+            Assert-Equal 'no-rules' $r.json.gate_reasons.guideline
+
+            $script:DcDeliveryPath = $DcScript
+            Write-DcFile 'guidelines/rules.json' '{ malformed'
+            $r = Invoke-Dc -NoResults
+            Assert-Equal 2 $r.exit
+            Assert-Equal 'error' $r.json.gates.guideline
+            Assert-True ('guideline-check-error' -in $r.codes)
+        } finally { Remove-DcProject }
     }
 }
 
@@ -441,6 +652,6 @@ Describe-Suite 'delivery-check / UI 驗收方式（gherkin-check 第 6 項帶上
             Assert-Equal 2 $r.exit "沒在 chromium 跑卻交付得出去：$($r.stdout)"
             $g = @($r.json.problems | Where-Object code -eq 'gherkin')[0]
             Assert-Match '沒有在驗收方式宣告的 project 通過：未出貨的訂單可以取消（chromium）' (@($g.items) -join '|')
-        } finally { Remove-Item $DcRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        } finally { Remove-DcProject }
     }
 }

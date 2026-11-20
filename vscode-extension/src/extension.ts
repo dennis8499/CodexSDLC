@@ -245,7 +245,7 @@ class Cockpit implements vscode.Disposable {
       this.schedule(s, 800);
     };
     // agent 的產出（doctor 拿來跟 hook 心跳比的那幾種檔）：只排一次延後的健檢，同一段時間寫再多次也只跑一次。
-    const outputWatcher = vscode.workspace.createFileSystemWatcher('**/bdd-docs/{project-map.md,*/analysis.md,*/current-state.md,*/review.md}');
+    const outputWatcher = vscode.workspace.createFileSystemWatcher('**/bdd-docs/{project-map.md,*/analysis.md,*/current-state.md,*/review.md,*/spec-review.md}');
     const onOutput = (uri: vscode.Uri) => {
       const s = this.stateFor(uri);
       if (!s || s.heartbeatTimer) return;

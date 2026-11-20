@@ -1,27 +1,7 @@
 # delivery-check.ps1
-# ⑥ 交付前的總檢查：一次跑完、只回一份精簡收據。orchestrator 寫完 spec.md 的「交付」一節之後跑一次，過了才回報交付。
-#
-# 為什麼要有它（借自 archify 的 finalize：一個指令串起所有關卡、回一份有界的收據，沒過的每一項附修法）：
-# ⑥ 以前全是榮譽制 —— orchestrator 憑記憶把好幾輪子代理的回傳拼成殘留風險，沒有任何東西核對。
-# 漏掉的那一項不會讓任何測試變紅，只會讓下一次迭代或修 bug 的人以為那裡驗過了。而它要的資料大多已經在磁碟上：
-#   1. 審核：bdd-docs/{id}/review.md 存在，VERDICT 是 PASS；是 FAIL（使用者在修正輪上限接受了這一版）時，
-#      每一項還開著的 [必修] 都要寫進交付。
-#   2. 驗收條件：repo 裡首行 `# feature-id: {id}` 的 .feature 交給 gherkin-check 跑一次（帶 -TestResults）。
-#      最後一輪修正之後沒重跑測試的話，結果檔會比改過的檔舊 —— 這裡擋得到，implementer 回報當時的綠燈擋不到。
-#   3. 交付一節：spec.md 有 `## 交付 —— {日期}`、裡面有「殘留風險」那一行，而且提到下面每一項：
-#        - .feature 裡標 @manual 的 scenario（待人工驗證）
-#        - 審核快照（reviews/*.md）與 review.md 裡每一項「接受不修」
-#        - review.md 是 FAIL 時還開著的每一項 [必修]
-#      「提到」是寬鬆的：任何一節「交付」（含前幾次迭代的）提到那條 scenario 的標題（只比字母和數字），
-#      或那個檔的路徑／檔名就算。寬的那一側：同一個檔另一個問題也算數，不會假紅。
-#   4. 寫檔時那兩道 gate 再跑一次：這個 feature 的 bdd-docs/ 產出跑殘留掃描（dlp-gate），這次改過的檔跑規範的 block 規則
-#      （guideline-gate）。hooks 跑不起來的環境（公司政策只允許管理員部署的 hooks）寫檔時沒有人擋，這是最後一道。
-# 「外部來源只用替身驗過」只在 implementer 的回傳裡、不在磁碟上 —— 這支看不到，通過時提醒一句。
-#
-# 唯讀：不寫任何檔。DLP：只回 scenario 標題、檔:行與審核的問題摘要（都已經在 bdd-docs/ 或 QA 的 .feature 裡）。
-#
-# Exit: 0 = 可以交付；2 = 有沒過的項目（訊息附修法）；1 = feature-id 不合法、找不到 spec.md 等錯誤。
-
+# ⑥ 交付前的唯讀檢查。核對本次程式碼審查、Gherkin 和交付殘留風險，
+# 並重跑敏感資料掃描及團隊規範檢查。輸出只含結論、位置與有界的修正提示。
+# Exit: 0 = 可以交付；2 = 有阻擋項目；1 = feature-id 或 spec.md 入口無效。
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$FeatureId,
@@ -54,32 +34,6 @@ function Fail-Hard([string]$msg) {
 }
 
 function NormId([string]$s) { return ($s -replace '[^\p{L}\p{N}]', '').ToLowerInvariant() }
-
-# 解析格式跟 dlp-gate 的 Get-MustItems 同一條（reviewer.toml 規定的那一行）。
-function Get-MustItems([string]$text) {
-    $out = @()
-    foreach ($line in ($text -replace "`r`n", "`n") -split "`n") {
-        $m = [regex]::Match($line, '^\s*\d+\.\s*\[必修\]\s*(.+?)\s+——\s+(.+?)\s*$')
-        if (-not $m.Success) { continue }
-        $loc = $m.Groups[1].Value.Trim().Trim('`', '{', '}')
-        $out += [pscustomobject]@{ location = $loc; file = ($loc -replace '(:\d+(-\d+)?)+$', ''); problem = $m.Groups[2].Value }
-    }
-    return $out
-}
-
-# 「## 上一輪必修的交代」裡的「接受不修」（格式同 dlp-gate 的 Get-AccountedFiles）。
-function Get-AcceptedItems([string]$text) {
-    $out = @(); $in = $false
-    foreach ($line in ($text -replace "`r`n", "`n") -split "`n") {
-        if ($line -match '^##\s') { $in = $line -match '^##\s*上一輪必修的交代'; continue }
-        if (-not $in) { continue }
-        $m = [regex]::Match($line, '^\s*[-*]\s*(.+?)\s+——\s+(.+?)[:：]\s*接受不修\s*——\s*\S')
-        if (-not $m.Success) { continue }
-        $loc = $m.Groups[1].Value.Trim().Trim('`', '{', '}')
-        $out += [pscustomobject]@{ location = $loc; file = ($loc -replace '(:\d+(-\d+)?)+$', ''); problem = $m.Groups[2].Value.Trim() }
-    }
-    return $out
-}
 
 # 首行 `# feature-id: {id}` 的 .feature（判法跟 gherkin-check 找 spec 的那一條相同：第一個 feature-id 行）。
 # 單一 repo 用 git（照 .gitignore 篩）；工作區底下有好幾個 repo、或根目錄不是 repo 時逐檔走 —— 根目錄的 git 看不進
@@ -117,37 +71,29 @@ function Add-Problem([string]$code, [string]$detail, [string]$fix, [string[]]$it
 if ($FeatureId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { Fail-Hard "feature-id「$FeatureId」不合法 —— 是 bdd-docs/ 底下那個目錄名" }
 $specRel = "$(($DocsRoot -replace '\\', '/').TrimEnd('/'))/$FeatureId/spec.md"
 if (-not (Test-Path -LiteralPath $specRel -PathType Leaf)) { Fail-Hard "找不到 $specRel" }
-$specText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $specRel).Path) -replace "`r`n", "`n"
-$featureDir = Split-Path $specRel -Parent
+$specPath = (Resolve-Path -LiteralPath $specRel).Path
+$featureDir = Split-Path $specPath -Parent
+$workspaceRoot = (Get-Location).Path
+$specText = [IO.File]::ReadAllText($specPath) -replace '\r\n', [string][char]10
 
 # ---- 1. 審核 ----
-$verdict = $null
-$openMust = @()
-$reviewRel = "$featureDir/review.md" -replace '\\', '/'
-if (-not (Test-Path -LiteralPath $reviewRel -PathType Leaf)) {
-    Add-Problem 'no-review' "沒有 $reviewRel —— ⑤ 沒跑過" '委派 reviewer（mode: code）審過再交付'
-} else {
-    $reviewText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $reviewRel).Path)
-    $vm = [regex]::Match($reviewText, '(?m)^\s*VERDICT\s*:\s*(PASS|FAIL)\b')
-    if (-not $vm.Success) {
-        Add-Problem 'review-no-verdict' "$reviewRel 沒有 VERDICT: PASS | FAIL 那一行" '請 reviewer 照它的格式重寫 review.md'
-    } else {
-        $verdict = $vm.Groups[1].Value
-        if ($verdict -eq 'FAIL') { $openMust = @(Get-MustItems $reviewText) }
+$reviewRel = (Join-Path (Split-Path $specRel -Parent) 'review.md') -replace '\\', '/'
+$review = $null
+try {
+    . (Join-Path $PSScriptRoot 'lib/review-state.ps1')
+    $review = Get-ReviewDeliveryEvidence -WorkspaceRoot $workspaceRoot -FeatureDir $featureDir
+    $reviewProblems = @($review.problems | Where-Object { $_ })
+    if (-not $reviewProblems.Count -and
+        ($review.mode -notin @('code', 'minimal') -or $review.verdict -notin @('PASS', 'FAIL') -or -not $review.version)) {
+        throw 'Incomplete review result'
     }
-}
-# 接受不修：每一輪快照加上最新的 review.md（「上一輪必修的交代」只涵蓋上一輪，早幾輪接受的只留在快照裡）。
-$accepted = @()
-$reviewSources = @(Get-ChildItem -LiteralPath (Join-Path $featureDir 'reviews') -Filter '*.md' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc, Name | ForEach-Object { $_.FullName })
-if (Test-Path -LiteralPath $reviewRel -PathType Leaf) { $reviewSources += (Resolve-Path -LiteralPath $reviewRel).Path }
-$seen = @{}
-foreach ($src in $reviewSources) {
-    foreach ($a in @(Get-AcceptedItems ([IO.File]::ReadAllText($src)))) {
-        $k = "$($a.file)|$(NormId $a.problem)"
-        if (-not $seen.ContainsKey($k)) { $seen[$k] = $true; $accepted += $a }
+    foreach ($p in $reviewProblems) {
+        Add-Problem $p.code $p.detail $p.fix @($p.items)
     }
+} catch {
+    Add-Problem 'review-evidence-error' '無法讀回或核對審查證據' '確認 review-check 與其依賴已安裝，修正紀錄後再跑交付檢查'
 }
-
+$verdict = $review.verdict
 # ---- 2. 驗收條件（gherkin-check） ----
 $features = @(Get-FeatureFiles $FeatureId)
 $manual = @()
@@ -213,17 +159,11 @@ $gherkin.manual = $manual
 $sections = @([regex]::Matches($specText, '(?ms)^##[ \t]*交付[^\n]*\n(.*?)(?=^##\s|\z)') | ForEach-Object { $_.Groups[1].Value })
 $allDelivery = $sections -join "`n"
 $deliveryNorm = NormId $allDelivery
-$deliveryLower = $allDelivery.ToLowerInvariant()
-function Test-Mentioned([string]$file) {
-    if (-not $file) { return $false }
-    $f = ($file -replace '\\', '/').ToLowerInvariant()
-    $leaf = [IO.Path]::GetFileName($f)
-    return $deliveryLower.Contains($f) -or ($leaf -and $deliveryLower.Contains($leaf))
-}
 $required = @()
-foreach ($s in $manual)   { $required += [pscustomobject]@{ kind = 'manual';   text = "待人工驗證：$s"; ok = ([bool]$deliveryNorm -and $deliveryNorm.Contains((NormId $s))) } }
-foreach ($a in $accepted) { $required += [pscustomobject]@{ kind = 'accepted'; text = "接受不修：$($a.location) —— $($a.problem)"; ok = (Test-Mentioned $a.file) } }
-foreach ($o in $openMust) { $required += [pscustomobject]@{ kind = 'open-must'; text = "未修（審核 FAIL）：$($o.location) —— $($o.problem)"; ok = (Test-Mentioned $o.file) } }
+foreach ($s in $manual) {
+    $required += [pscustomobject]@{ text = "待人工驗證：$s"; ok = ([bool]$deliveryNorm -and $deliveryNorm.Contains((NormId $s))) }
+}
+$required += @($review.risks | Where-Object { $_ })
 $missing = @($required | Where-Object { -not $_.ok })
 
 if (-not $sections.Count) {
@@ -232,81 +172,158 @@ if (-not $sections.Count) {
     Add-Problem 'delivery-no-risk-line' '最後那一節「交付」沒有寫殘留風險' '補一行「殘留風險：」，逐項列出；沒有就寫「殘留風險：無」'
 }
 if ($missing.Count) {
-    Add-Problem 'delivery-missing-risk' '這幾項殘留風險沒有寫進「交付」' '一項一行寫進最後那一節「交付」的殘留風險（照下面的寫法；檔:行與 scenario 標題要寫出來，這支靠它們對）' @($missing | ForEach-Object { $_.text })
+    Add-Problem 'delivery-missing-risk' '本次交付缺少殘留風險的逐項處置' '在本次交付列出審查版本與問題 ID，待人工驗證以 scenario 標題列出' @($missing | ForEach-Object { $_.text })
 }
-# FAIL 本身不擋：使用者在修正輪上限接受了這一版就能交付，代價是每一項必修都寫進殘留風險（上面已經核對）。
-# 但 FAIL 卻一項必修都沒有 → reviewer 寫壞了，那不能當成「接受了」。
-if ($verdict -eq 'FAIL' -and -not $openMust.Count) {
-    Add-Problem 'review-fail-without-must' 'review.md 是 FAIL，卻解析不到任何 [必修]' '請 reviewer 照格式重寫（「N. [必修] 檔:行 —— 問題」），或確認這一版到底能不能交'
+# ---- 4. 寫檔時的 gates ----
+function Invoke-DeliveryGate([string]$name, [hashtable]$parameters) {
+    try {
+        $global:LASTEXITCODE = -1
+        $raw = & (Join-Path $PSScriptRoot $name) @parameters 2>$null
+        $gateExit = $LASTEXITCODE
+        $result = ($raw | Out-String) | ConvertFrom-Json -NoEnumerate
+        if ($result -is [pscustomobject] -and $result.passed -is [bool] -and
+            $gateExit -eq $(if ($result.passed) { 0 } else { 2 })) {
+            return $result
+        }
+    } catch { }
+    return $null
 }
 
-# ---- 4. 寫檔時那兩道 gate，交付前再跑一次 ----
-# hooks 跑不起來的環境（公司政策只允許管理員部署的 hooks、或沒信任）寫檔時沒有人擋 —— 這裡是最後一道。
-# hooks 有在跑時這兩項本來就是綠的，多跑一次只花幾秒。
-#   - 殘留掃描（dlp-gate）：這個 feature 的 bdd-docs/ 產出，加上 project-map.md。
-#   - 規範（guideline-gate）：工作區裡每個 repo 改過或新增的檔（lib/workspace-repos.ps1）。不掃整個 repo ——
-#     既有的違規不是這次造成的，擋下來 orchestrator 也無從處理。不是 git 的專案判不出改過哪些檔，跳過（gates.guideline 說明）。
-$gates = [ordered]@{ dlp = $null; guideline = $null }
-$here = (Get-Location).Path
-$dlpTargets = @(Get-ChildItem -LiteralPath $featureDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { [IO.Path]::GetRelativePath($here, $_.FullName) -replace '\\', '/' })
-if (Test-Path -LiteralPath "$DocsRoot/project-map.md" -PathType Leaf) { $dlpTargets += "$($DocsRoot.TrimEnd('/', '\'))/project-map.md" }
-if ($dlpTargets.Count) {
-    $dlp = $null
-    try { $dlp = (& (Join-Path $PSScriptRoot 'dlp-gate.ps1') -Path $dlpTargets -Json 2>$null | Out-String) | ConvertFrom-Json } catch { }
-    if (-not $dlp) { $gates.dlp = 'error' }
-    elseif ($dlp.disabled) { $gates.dlp = 'disabled' }
-    else {
-        $gates.dlp = if ($dlp.passed) { 'passed' } else { 'failed' }
-        if (-not $dlp.passed) {
-            Add-Problem 'dlp-residual' 'bdd-docs/ 的產出有殘留的敏感資料樣式（只列類別與行號）' '刪掉那個檔，遮蔽後重產（敏感值換成占位符；DB 結果只留結構與筆數）；改完再跑一次' @($dlp.findings | ForEach-Object { "$($_.file)：$(@($_.categories | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.type } }) -join '、')（行 $(@($_.lines) -join ',')）" })
+$gates = [ordered]@{ dlp = 'not-applicable'; guideline = 'not-applicable' }
+$gateReasons = [ordered]@{ dlp = 'no-targets'; guideline = 'no-targets' }
+$docsFull = Split-Path $featureDir -Parent
+$docsRel = [IO.Path]::GetRelativePath($workspaceRoot, $docsFull).Replace('\', '/')
+if (Test-Path -LiteralPath (Join-Path $docsFull '.dlp-disabled') -PathType Leaf) {
+    $gates.dlp = 'disabled'
+    $gateReasons.dlp = '.dlp-disabled'
+} else {
+    try {
+        $dlpTargets = @(Get-ChildItem -LiteralPath $featureDir -Recurse -File -ErrorAction Stop |
+            ForEach-Object { [IO.Path]::GetRelativePath($workspaceRoot, $_.FullName).Replace('\', '/') })
+        $mapPath = Join-Path $docsFull 'project-map.md'
+        if (Test-Path -LiteralPath $mapPath -PathType Leaf) { $dlpTargets += "$docsRel/project-map.md" }
+        if ($dlpTargets.Count) {
+            $dlp = Invoke-DeliveryGate 'dlp-gate.ps1' @{ Path = $dlpTargets; DocsRoot = $docsFull; Json = $true }
+            if (-not $dlp -or $dlp.disabled -ne $false -or $dlp.status -notin @('passed', 'failed') -or
+                $dlp.passed -ne ($dlp.status -eq 'passed') -or $dlp.scanned -isnot [array] -or
+                @($dlpTargets | Where-Object { $_ -notin $dlp.scanned }).Count -or
+                $dlp.findings -isnot [array] -or $dlp.passed -ne ($dlp.findings.Count -eq 0)) {
+                throw 'Incomplete DLP result'
+            }
+            $gates.dlp = $dlp.status
+            $gateReasons.dlp = $null
+            if (-not $dlp.passed) {
+                Add-Problem 'dlp-residual' '需求產出有殘留的敏感資料樣式（只列類別與行號）' '遮蔽後重產，再跑交付檢查' @(
+                    $dlp.findings | ForEach-Object {
+                        $types = @($_.categories | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.type } })
+                        "$($_.file)：$($types -join '、')（行 $($_.lines -join ',')）"
+                    }
+                )
+            }
         }
+    } catch {
+        $gates.dlp = 'error'
+        $gateReasons.dlp = 'scan-error'
+        Add-Problem 'dlp-check-error' '必要的殘留掃描執行錯誤或結果不完整' '確認 dlp-gate.ps1、dlp-residual-scan.ps1 與產出可讀後重跑'
     }
 }
-$changed = @()
-$repos = @(Get-WorkspaceRepos $here)
-foreach ($repo in $repos) {
-    $top = @((Invoke-GitUtf8 $repo.dir @('rev-parse', '--show-toplevel')).lines) | Select-Object -First 1
-    if (-not $top) { continue }
-    $changed += @(@((Invoke-GitUtf8 $top @('diff', '--name-only', 'HEAD')).lines) + @((Invoke-GitUtf8 $top @('ls-files', '--others', '--exclude-standard')).lines) |
-        ForEach-Object { [IO.Path]::GetRelativePath($here, (Join-Path $top $_)) -replace '\\', '/' })
-}
-$docsPrefix = ($DocsRoot -replace '\\', '/').Trim('/') + '/'
-$changed = @($changed | Select-Object -Unique | Where-Object { -not $_.StartsWith($docsPrefix) -and (Test-Path -LiteralPath $_ -PathType Leaf) })
-if (-not $repos.Count) { $gates.guideline = 'no-git' }
-elseif ($changed.Count) {
-    $gl = $null
-    try { $gl = (& (Join-Path $PSScriptRoot 'guideline-gate.ps1') -Path $changed -Json -MaxReport 50 2>$null | Out-String) | ConvertFrom-Json } catch { }
-    $gates.guideline = if (-not $gl) { 'error' } else { $gl.status }
-    if ($gl -and $gl.block_count -gt 0) {
-        $gates.guideline = 'failed'
-        Add-Problem 'guideline-block' "改過的檔違反 guidelines/rules.json 的 block 規則（$($gl.block_count) 處）" '交回 implementer（mode: fix）依規則修正；規則本身有誤就改 rules.json（或降為 warn）' @($gl.hits | Where-Object severity -eq 'block' | ForEach-Object { "$($_.file):$($_.line) —— $($_.rule)" })
+
+if (Test-Path -LiteralPath 'guidelines/.gate-disabled' -PathType Leaf) {
+    $gates.guideline = 'disabled'
+    $gateReasons.guideline = '.gate-disabled'
+} else {
+    try {
+        $repos = @(Get-WorkspaceRepos $workspaceRoot)
+        if (-not $repos.Count) {
+            if (Test-Path -LiteralPath '.git') { throw 'Git checkout cannot be read' }
+            $gateReasons.guideline = 'no-git'
+        }
+        $changed = @()
+        foreach ($repo in $repos) {
+            $topResult = Invoke-GitUtf8 $repo.dir @('rev-parse', '--show-toplevel')
+            if (-not $topResult.ok -or -not $topResult.lines.Count) { throw 'Git checkout cannot be read' }
+            $top = $topResult.lines[0]
+            $unstaged = Invoke-GitUtf8 $top @('diff', '--name-only', '--')
+            $staged = Invoke-GitUtf8 $top @('diff', '--cached', '--name-only', '--')
+            $untracked = Invoke-GitUtf8 $top @('ls-files', '--others', '--exclude-standard')
+            if (-not ($unstaged.ok -and $staged.ok -and $untracked.ok)) { throw 'Git changes cannot be read' }
+            foreach ($file in @($unstaged.lines + $staged.lines + $untracked.lines)) {
+                $changed += [IO.Path]::GetRelativePath($workspaceRoot, (Join-Path $top $file)).Replace('\', '/')
+            }
+        }
+        $changed = @($changed | Select-Object -Unique | Where-Object {
+            -not $_.StartsWith("$docsRel/") -and -not $_.StartsWith('../') -and (Test-Path -LiteralPath $_ -PathType Leaf)
+        })
+        if ($changed.Count -and -not (Test-Path -LiteralPath 'guidelines/rules.json')) {
+            $gateReasons.guideline = 'no-rules'
+        } elseif ($changed.Count) {
+            $gl = Invoke-DeliveryGate 'guideline-gate.ps1' @{ Path = $changed; Strict = $true; Json = $true; MaxReport = 50 }
+            if (-not $gl -or $gl.status -notin @('scanned', 'no-rules', 'no-targets') -or
+                $gl.problems -isnot [array] -or $gl.problems.Count -or
+                ($gl.block_count -isnot [long] -and $gl.block_count -isnot [int]) -or
+                $gl.block_count -lt 0 -or $gl.passed -ne ($gl.block_count -eq 0) -or
+                $gl.hits -isnot [array] -or $gl.files -isnot [array] -or $gl.scanned_files -ne $gl.files.Count -or
+                ($gl.status -eq 'scanned' -and -not $gl.scanned_files)) {
+                throw 'Incomplete guideline result'
+            }
+            if ($gl.status -eq 'scanned') {
+                $gates.guideline = if ($gl.passed) { 'passed' } else { 'failed' }
+                $gateReasons.guideline = $null
+                if (-not $gl.passed) {
+                    Add-Problem 'guideline-block' "改過的檔違反團隊規範的 block 規則（$($gl.block_count) 處）" '交回 implementer 依規則修正' @(
+                        $gl.hits | Where-Object severity -eq 'block' | ForEach-Object { "$($_.file):$($_.line) —— $($_.rule)" }
+                    )
+                }
+            } else {
+                if (-not $gl.passed) { throw 'Inconsistent guideline result' }
+                $gateReasons.guideline = $gl.status
+            }
+        }
+    } catch {
+        $gates.guideline = 'error'
+        $gateReasons.guideline = 'scan-error'
+        Add-Problem 'guideline-check-error' '必要的團隊規範檢查執行錯誤或結果不完整' '確認 Git、guideline-gate.ps1 與 guidelines/rules.json 後重跑'
     }
 }
 
 $passed = $problems.Count -eq 0
 $reminder ='「外部來源只用替身驗過」只在 implementer 的回傳裡，這支看不到 —— 有的話確認已寫進交付。'
 
+$gateLabels = @{
+    'passed' = '通過'
+    'not-applicable' = '不適用'
+    'disabled' = '按設定停用'
+    'failed' = '規則未通過'
+    'error' = '執行錯誤'
+}
+$dl = "殘留掃描：$($gateLabels[$gates.dlp])"
+$gl = switch ($gateReasons.guideline) {
+    'no-git' { '規範：不是 git（不適用）' }
+    'no-rules' { '規範：沒有 rules.json 或適用規則（不適用）' }
+    default { "規範：$($gateLabels[$gates.guideline])" }
+}
+
 if ($Json) {
     [pscustomobject]@{
         passed     = $passed
         feature_id = $FeatureId
         spec       = $specRel
-        review     = [pscustomobject]@{ path = $reviewRel; verdict = $verdict }
+        review     = [pscustomobject]@{ path = $reviewRel; verdict = $verdict; mode = $review.mode; version = $review.version }
         gherkin    = [pscustomobject]$gherkin
         delivery   = [pscustomobject]@{ sections = $sections.Count; required = @($required | ForEach-Object { $_.text }); missing = @($missing | ForEach-Object { $_.text }) }
         gates      = [pscustomobject]$gates
+        gate_reasons = [pscustomobject]$gateReasons
         problems   = @($problems)
         reminder   = $reminder
     } | ConvertTo-Json -Depth 6 -Compress
 } elseif ($passed) {
     $g = if ($gherkin.applicable) { "gherkin-check 通過（$($features.Count) 個 .feature$(if ($manual.Count) { "，$($manual.Count) 條 @manual" })）" } else { '沒有 .feature（不適用）' }
-    $v = if ($verdict -eq 'FAIL') { '審核 FAIL（每一項必修都已列進殘留風險）' } else { '審核 PASS' }
-    $gl = switch ($gates.guideline) { "no-git" { "規範：不是 git、判不出改過的檔，沒掃" } $null { "規範：沒有改過的檔" } "no-rules" { "規範：沒有 rules.json" } "disabled" { "規範：已被 .gate-disabled 關閉" } default { "規範：通過" } }
-    $dl = switch ($gates.dlp) { "disabled" { "殘留掃描：已被 .dlp-disabled 關閉" } $null { "殘留掃描：沒有產出" } default { "殘留掃描：通過" } }
+    $v = if ($review.mode -eq 'minimal') { '經同意採最小審核' } elseif ($verdict -eq 'FAIL') { '審核 FAIL（逐項接受風險）' } else { '審核 PASS' }
     "[delivery-check] OK — $FeatureId：$v、$g、交付一節列了 $($required.Count) 項要列的殘留風險；$dl、$gl。"
     "  ! $reminder"
 } else {
     [Console]::Error.WriteLine("[delivery-check] $FeatureId：$($problems.Count) 項沒過，先處理再交付：")
+    [Console]::Error.WriteLine("  $dl；$gl。")
     foreach ($p in $problems) {
         [Console]::Error.WriteLine("  - $($p.code)：$($p.detail)")
         foreach ($i in $p.items) { [Console]::Error.WriteLine("      $i") }
